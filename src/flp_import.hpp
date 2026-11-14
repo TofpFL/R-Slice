@@ -38,6 +38,7 @@ struct FlpPlaylistItem {
     uint32_t startTick = 0, lengthTicks = 0;
     int64_t offsetTicks = 0;  // start trim: where the clip's window begins inside the pattern
     bool muted = false;         // item_flags bit 0x2000
+    int flags = 0;              // raw item_flags, for diagnostics
 };
 
 struct FlpPattern {

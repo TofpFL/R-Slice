@@ -1403,15 +1403,25 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
         : 0;
     std::unordered_map<int, uint64_t> patPeriodUs;
     for (const FlpPattern& fp : project.patterns) {
-        uint64_t ticks = fp.lengthTicks;
-        if (!ticks) {
-            uint64_t maxEnd = 0;
-            for (const FlpNote& n : fp.notes)
-                maxEnd = std::max<uint64_t>(maxEnd, uint64_t(n.time) + uint64_t(n.duration));
-            if (maxEnd && barTicks)
-                ticks = (maxEnd + barTicks - 1) / barTicks * barTicks;
+        // Loop length: a declared pattern length wins unless it overhangs
+        // the content; otherwise the pattern ends at the bar-cell holding
+        // its last note ONSET - trailing empty space after the final note
+        // (and duration tails ringing past the loop point) is not part of
+        // the duration. Rounding note END+duration up a whole cell used to
+        // inflate every loop by up to a full bar of phantom time.
+        uint64_t lastStart = 0, maxEnd = 0;
+        for (const FlpNote& n : fp.notes) {
+            lastStart = std::max<uint64_t>(lastStart, uint64_t(n.time));
+            maxEnd = std::max<uint64_t>(maxEnd, uint64_t(n.time) + uint64_t(n.duration));
         }
-        if (ticks)
+        uint64_t contentTicks = 0;
+        if (barTicks)
+            contentTicks = lastStart ? (lastStart + barTicks - 1) / barTicks * barTicks : barTicks;
+        else
+            contentTicks = maxEnd;
+        uint64_t ticks = fp.lengthTicks;
+        if (!ticks || (contentTicks && ticks > contentTicks)) ticks = contentTicks;
+        if (ticks && !fp.notes.empty())
             patPeriodUs[fp.number] = uint64_t(std::llround(double(ticks) * usPerTick));
     }
 

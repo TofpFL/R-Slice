@@ -234,8 +234,10 @@ bool readFlp(std::string_view bytes, FlpProject& out, std::string& err) {
                 case kPatName:
                     if (prevId == kPatStart) pattern(int(prevValue)).name = flString(data, len);
                     break;
-                case 164:  // pattern length in ticks (metadata section, after its kPatStart)
-                    pattern(curPattern).lengthTicks = value;
+                case 164:  // pattern length in ticks - DWORD+36 per pyflp, but
+                    // only inside pattern blocks; channel/plugin param blocks
+                    // reuse the id space (values like 35-130 are param data).
+                    if (!chanCtx) pattern(curPattern).lengthTicks = value;
                     break;
                 case kPlaylist: {
                 // FL grew the playlist record across versions (32/60/88/... bytes).
@@ -298,6 +300,7 @@ bool readFlp(std::string_view bytes, FlpProject& out, std::string& err) {
                         it.offsetTicks = st > 0 ? st : 0;
                     }
                     it.muted = (flags & 0x2000) != 0;
+                    it.flags = flags;
                     out.playlist.push_back(it);
                 }
                 break;
