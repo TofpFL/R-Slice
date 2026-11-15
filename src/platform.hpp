@@ -44,6 +44,9 @@ std::string userDir();
 void prepareDataDir(const std::string& base);
 // Android: keep the screen on and mute the game while it is in the background.
 void afterWindowInit();
+// Windows: pushes the exe's embedded icon onto the running window
+// (title bar + taskbar). No-op elsewhere.
+void setWindowIcon();
 // Wait for the screen's refresh (on) or present frames as soon as they are
 // ready (off). Applied at once; Android asks EGL for it.
 void setVsync(bool on);
@@ -58,6 +61,9 @@ bool takeResumed();             // true once after the app comes back
 void rememberVolume(float v);   // master volume to restore after the background
 // Path shown to the player for a folder inside base (e.g. "Android/data/.../mods").
 std::string displayPath(const std::string& path);
+
+// Process working-set size in MB (debug overlay); 0 where unsupported.
+double processMemoryMB();
 
 // HTTPS download to a file. Android only (through java.net); desktop uses curl.
 bool download(const std::string& url, const std::string& dest, std::string& err);

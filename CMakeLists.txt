@@ -100,12 +100,16 @@ add_library(gh_core STATIC
   src/song_scan.cpp
   src/flp_import.cpp
   src/raid.cpp
+  src/raid_doc.cpp
+  src/modchart.cpp
+  src/visuals.cpp
   src/raid_chart.cpp
   src/lua_host.cpp
   src/replay.cpp
   src/rchr.cpp
   src/mod_install.cpp
   src/autochart.cpp
+  src/ram.cpp
 )
 target_include_directories(gh_core PUBLIC src)
 target_link_libraries(gh_core PUBLIC Threads::Threads gh_lua gh_miniz)
@@ -218,10 +222,13 @@ if(GH_BUILD_GAME)
     src/characters.cpp
     src/stage.cpp
     src/states_menu.cpp
+    src/title_atlas.cpp
+  src/vslice_ui.cpp
     src/states_options.cpp
     src/state_play.cpp
     src/vizbar.cpp
     src/play_psych.cpp
+    src/play_visuals.cpp
     src/scene_draw.cpp
     src/video.cpp
     src/state_results.cpp
@@ -253,7 +260,7 @@ if(GH_BUILD_GAME)
     else()
       target_sources(raide PRIVATE src/windows/raide.rc)
     endif()
-    target_sources(raide PRIVATE src/windows/raide_icon.rc)  # RAID_File_Icon.ico
+    target_sources(raide PRIVATE src/windows/resource.rc src/win_icon.cpp)  # assets/icon.ico
   endif()
   target_link_libraries(raide PRIVATE gh_core raylib)
   target_compile_definitions(raide PRIVATE GH_VERSION="${PROJECT_VERSION}")

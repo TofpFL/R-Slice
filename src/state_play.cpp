@@ -1,6 +1,7 @@
 ﻿// The duel: game flow, input, judgement events, classic visuals and the HUD.
 // Psych-mode scene and scripting live in play_psych.cpp.
 #include "state_play.hpp"
+#include "vslice_ui.hpp"
 #include "psych_ui.hpp"
 
 #include <algorithm>
@@ -189,6 +190,7 @@ void PlayState::update(double dt) {
     session_.update(songMs_);
     handleNoteEvents();
     processChartEvents();
+    updateVisuals(songMs_);
     adaptNoteGap();
     if (a.settings.noteCounter > 0) {  // notes per second of each side
         npsWindow_.push_back({now, session_.judged(), session_.opponentHits});
@@ -241,6 +243,7 @@ void PlayState::update(double dt) {
         psychUpdate(dt);
         if (phase_ != Phase::Playing) return;
     }
+    updateModchart(songMs_);
     updateJsEngine(dt);
     beatPulse_ = std::max(0.0f, beatPulse_ - float(dt) * 4.0f);
     minePulse_ = std::max(0.0f, minePulse_ - float(dt) * 3.0f);
@@ -344,6 +347,8 @@ void PlayState::setup() {
         rendering_ = a.startRender(entry_->title, req_.diff);
         if (rendering_) cfg_.botplay = true;
     }
+    visualsOnly_ = req_.visualsOnly && !replaying_;
+    if (visualsOnly_) cfg_.botplay = true;  // a showcase: notes hit themselves so characters sing
     const CharId opp = entry_->builtin ? charFromName(entry_->opponent) : CharId::Shade;
     left_ = CharacterState{};
     left_.id = opp;
@@ -472,6 +477,7 @@ void PlayState::restart() {
         startPatternLog();  // fresh log for the replayed run
     }
     popups_.clear();
+    clearVisuals();
     fx_.clear();
     for (auto& s : confirm_)
         for (float& c : s) c = 0;
@@ -661,6 +667,11 @@ void PlayState::handleInput() {
         // 7: this song in the chart editor, as in Psych (unless 7 is a lane).
         if (e.down && (e.code == KEY_SEVEN || e.code == KEY_KP_7) && !keyReserved(e.code) && !replaying_ && !cutscene_) {
             openChartEditor();
+            return;
+        }
+        // 8: this song's visuals.json timeline in the Visuals Editor.
+        if (e.down && (e.code == KEY_EIGHT || e.code == KEY_KP_8) && !keyReserved(e.code) && !replaying_ && !cutscene_) {
+            openVisualsEditor();
             return;
         }
         if (e.code <= 0 || e.code >= Input::kMaxCodes || replaying_) continue;
@@ -1024,6 +1035,10 @@ void PlayState::exitToMenu() {
     if (scripts_) scripts_->call("onDestroy");
     a.mixer.stop();
     a.mixer.clear();
+    if (visualsOnly_) {
+        a.change(makeModchartEditorFor(req_.songId, req_.diff));
+        return;
+    }
     a.change(req_.story ? makeStory() : makeFreeplay());
 }
 
@@ -1035,6 +1050,70 @@ void PlayState::openChartEditor() {
     a.mixer.clear();
     sfxPlay(Sfx::Confirm);
     a.change(makeChartEditor(req_.songId, req_.diff));
+}
+
+void PlayState::openVisualsEditor() {
+    App& a = app();
+    stopRendering();
+    if (scripts_) scripts_->call("onDestroy");
+    a.mixer.stop();
+    a.mixer.clear();
+    sfxPlay(Sfx::Confirm);
+    a.visualsReturn = std::make_unique<PlayRequest>(req_);
+    a.change(makeVisualsEditorFor(req_.songId, req_.diff));
+}
+
+// modchart.json: evaluate every property track at songMs_ once, then apply
+// the camera/character results. Notes and receptors read mods_ in drawLanes.
+void PlayState::updateModchart(double songMs) {
+    mods_.clear();
+    if (chart_.modchart.tracks.empty()) return;
+    mods_ = evalAll(chart_.modchart, songMs);
+    if (!psych_ || !scene_) return;  // the classic path has no scene cameras yet
+    scene::Scene& sc = *scene_;
+    auto camMods = [&](scene::Camera& cam, const char* target) {
+        auto it = mods_.find(target);
+        if (it == mods_.end()) return;
+        const auto& m = it->second;
+        cam.zoom *= float(modVal(target, "zoom"));
+        cam.x += float(modVal(target, "x"));
+        cam.y += float(modVal(target, "y"));
+        cam.angle += float(modVal(target, "angle"));
+        cam.alpha *= float(modVal(target, "alpha"));
+    };
+    camMods(sc.camGame, "camera");
+    camMods(sc.camHud, "hud");
+    // Characters: x/y are offsets from where the stage/scripts put them.
+    for (const char* target : {"bf", "dad", "gf"}) {
+        scene::CharacterPtr c = target == std::string("bf") ? sc.bf : target == std::string("dad") ? sc.dad : sc.gf;
+        if (!c) continue;
+        const std::string t = target;
+        c->x += float(modVal(t.c_str(), "x"));
+        c->y += float(modVal(t.c_str(), "y"));
+        c->angle += float(modVal(t.c_str(), "angle"));
+        c->alpha *= float(modVal(t.c_str(), "alpha"));
+        c->scaleX *= float(modVal(t.c_str(), "scaleX"));
+        c->scaleY *= float(modVal(t.c_str(), "scaleY"));
+    }
+}
+
+double PlayState::modVal(const char* target, const char* prop) const {
+    if (mods_.empty()) {
+        for (const auto& [n, v] : modProps(target))
+            if (n == prop) return v;
+        return 0;
+    }
+    auto ti = mods_.find(target);
+    if (ti == mods_.end()) {
+        for (const auto& [n, v] : modProps(target))
+            if (n == prop) return v;
+        return 0;
+    }
+    auto pi = ti->second.find(prop);
+    if (pi != ti->second.end()) return pi->second;
+    for (const auto& [n, v] : modProps(target))
+        if (n == prop) return v;
+    return 0;
 }
 
 // Options from the pause menu: leaving them starts this song again, as in Psych.
@@ -1063,6 +1142,12 @@ void PlayState::finish() {
     finished_ = true;
     stopRendering();  // the video ends with the song
     if (scripts_) scripts_->call("onDestroy");
+    if (visualsOnly_) {  // a preview, not a run: back to the Visuals Editor
+        a.mixer.stop();
+        a.mixer.clear();
+        a.change(makeVisualsEditorFor(req_.songId, req_.diff));
+        return;
+    }
     ResultData r;
     r.req = req_;
     r.title = chart_.title.empty() ? entry_->title : chart_.title;
@@ -1171,7 +1256,14 @@ void PlayState::drawLanes() {
     const PsychUi& ui = psychUi();
     const int K = chart_.keys;
     const float ns = noteSize();
-    const double pxPerMs = 0.45 * scrollSpeed() / rate_;
+    const double nOffX = modVal("notes", "offsetX"), nOffY = modVal("notes", "offsetY");
+    const double nRot = modVal("notes", "rotation"), nAlpha = modVal("notes", "alpha");
+    const double nSX = modVal("notes", "scaleX"), nSY = modVal("notes", "scaleY");
+    const double nSpeed = modVal("notes", "multSpeed");
+    const double sOffX = modVal("strums", "offsetX"), sOffY = modVal("strums", "offsetY");
+    const double sScale = modVal("strums", "scale"), sAlpha = modVal("strums", "alpha");
+    const double sRot = modVal("strums", "rotation");
+    const double pxPerMs = 0.45 * scrollSpeed() / rate_ * nSpeed;
     const double reach = (gfx::H * 1.5 + ns) / pxPerMs;
     drawnNotes_ = candidateNotes_ = 0;
     drawnSide_[0] = drawnSide_[1] = 0;
@@ -1182,10 +1274,12 @@ void PlayState::drawLanes() {
         if (side == 0 && !s.opponentNotes) continue;  // Options: opponent notes (Psych hides their receptors and notes)
         for (int lane = 0; lane < K; ++lane) {
             const scene::Strum& st = strum(side, lane);
-            const Vector2 c = strumCenter(side, lane);
-            const float sc = st.scaleX / 0.7f;
+            Vector2 c = strumCenter(side, lane);
+            c.x += float(sOffX);
+            c.y += float(sOffY);
+            const float sc = st.scaleX / 0.7f * float(sScale);
             const float size = ns * std::fabs(sc);
-            const float alphaStrum = st.alpha;
+            const float alphaStrum = st.alpha * float(sAlpha);
             const int dir = gfx::laneDir(K, lane);
             const Color col = gfx::dirColor(dir);
             const bool rotated = std::fabs(st.direction - 90.0f) > 0.01f;
@@ -1217,7 +1311,7 @@ void PlayState::drawLanes() {
             }
             const float dirSign = st.downScroll ? -1.0f : 1.0f;
             const std::vector<LaneNote>& v = session_.lane(side, lane);
-            if (!v.empty()) {
+            if (!v.empty() && !visualsOnly_) {  // visuals preview: receptors only, no notes
                 ui.beginDir(dir);  // this lane's colours (Psych colour-template skins)
                 const double tStart = songMs_ - reach * 0.5 - session_.maxSustain(side, lane);
                 const double tEnd = songMs_ + reach;
@@ -1280,11 +1374,13 @@ void PlayState::drawLanes() {
                         drawnYMax_[side] = std::max(drawnYMax_[side], int(y));
                         ++drawnYHist_[side][b];
                     }
-                    const float al = (n.state == kMissed ? 0.35f : 1.0f) * alphaStrum * (nv ? nv->alpha : 1.0f);
+                    const float al = (n.state == kMissed ? 0.35f : 1.0f) * alphaStrum * float(nAlpha) * (nv ? nv->alpha : 1.0f);
                     if (al <= 0.002f) continue;
-                    const Vector2 p{c.x + (nv ? nv->offsetX : 0.0f), y + (nv ? nv->offsetY : 0.0f)};
-                    if (n.kind == kMine) drawMine(p, size, al, st.angle);
-                    else if (!ui.note(dir, p, size, al, st.angle)) gfx::drawNote(dir, p, size, al, 1.0f, st.angle);
+                    const float nsize = size * float(std::sqrt(std::max(0.01, nSX * nSY)));
+                    const float nang = st.angle + float(nRot);
+                    const Vector2 p{c.x + float(nOffX) + (nv ? nv->offsetX : 0.0f), y + float(nOffY) + (nv ? nv->offsetY : 0.0f)};
+                    if (n.kind == kMine) drawMine(p, nsize, al, nang);
+                    else if (!ui.note(dir, p, nsize, al, nang)) gfx::drawNote(dir, p, nsize, al, 1.0f, nang);
                 }
                 ui.endDir();
             }
@@ -1448,7 +1544,7 @@ void PlayState::drawHud() {
     const float timeTop = s.downscroll ? gfx::H - 44.0f : 19.0f;
     const float timeBarTop = timeTop + (ui.lineHeight(32) + 4) * 0.25f;
     float botAlpha = 1;
-    if ((cfg_.botplay || replaying_) && s.botplayText && hudShown("botplayTxt", &botAlpha)) {
+    if ((cfg_.botplay || replaying_) && s.botplayText && !visualsOnly_ && hudShown("botplayTxt", &botAlpha)) {
         const char* label = replaying_ ? "REPLAY" : "BOTPLAY";
         // Psych: under the time bar (above it in downscroll), fading out and
         // back in over a second, then a second fully shown.
@@ -1606,13 +1702,13 @@ void PlayState::drawPause() {
         return;
     }
     DrawRectangleRec({0, 0, gfx::W, gfx::H}, Color{6, 4, 12, 190});
-    gfx::glowText(FontId::Title, "PAUSED", gfx::W / 2, 140, 80, kGold, Color{255, 170, 60, 255});
-    gfx::text(FontId::Ui, chart_.title + "  -  " + req_.diff, gfx::W / 2, 250, 30, kIvory, Align::Center, 1.5f);
+    // V-Slice pause: dimmed playfield, a centred panel, chunky buttons.
+    vs::panel({gfx::W / 2 - 260, 190, 520, 400}, "PAUSED");
+    gfx::text(FontId::Ui, chart_.title + "  -  " + req_.diff, gfx::W / 2, 268, 26, kIvory, Align::Center, 1.5f);
     static const char* items[kPauseItems] = {"Resume", "Restart", "Options", "Exit to menu"};
     for (int i = 0; i < kPauseItems; ++i) {
         const bool on = i == pauseSel_;
-        gfx::text(FontId::Title, items[i], gfx::W / 2, 340.0f + i * 70, on ? 48.0f : 40.0f, on ? kGold : fade(kIvory, 0.6f),
-                  Align::Center, 2.0f);
+        vs::button({gfx::W / 2 - 180, 320.0f + i * 62, 360, 48}, items[i], on, on && i == 0);
     }
 }
 
@@ -1636,7 +1732,7 @@ void PlayState::drawPsychPause() {
         ui.text(info[i], gfx::W - 20, 15.0f + 32.0f * float(i) + 5.0f * k, 32, fade(WHITE, k), 1, 0);
     }
     if (cfg_.practice) ui.text("PRACTICE MODE", gfx::W - 20, 15.0f + 101.0f, 32, WHITE, 1, 0);
-    if (cfg_.botplay) ui.text("BOTPLAY", gfx::W - 20, 15.0f + (cfg_.practice ? 133.0f : 101.0f), 32, WHITE, 1, 0);
+    if (cfg_.botplay && !visualsOnly_) ui.text("BOTPLAY", gfx::W - 20, 15.0f + (cfg_.practice ? 133.0f : 101.0f), 32, WHITE, 1, 0);
     static const char* items[kPauseItems] = {"Resume", "Restart Song", "Options", "Exit to menu"};
     for (int i = 0; i < kPauseItems; ++i) {
         const float target = float(i) - pauseScroll_;

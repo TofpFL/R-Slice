@@ -1347,6 +1347,45 @@ bool writeRaid(const std::string& path, const std::vector<Event>& events,
                          statsOut, err);
 }
 
+bool writeRaidDoc(const std::string& path, const std::vector<char>& patSection,
+                  std::vector<DocChunkOut>& chunks, uint64_t logicalEvents,
+                  uint64_t literalEvents, uint64_t uniqueEvents,
+                  uint64_t uniqueNotes, std::string_view metaJson,
+                  const EncodeOptions& opt, Info* statsOut, std::string& err) {
+    err.clear();
+    if (opt.chunkEvents == 0 || opt.chunkEvents > uint32_t(kMaxChunkExpand) ||
+        opt.compressLevel < 1 || opt.compressLevel > 10) {
+        err = "invalid encode options";
+        return false;
+    }
+    if (patSection.size() < 8) { err = "empty pattern section"; return false; }
+    std::vector<ChunkOut> outs;
+    outs.reserve(chunks.size());
+    for (const DocChunkOut& d : chunks) {
+        if (d.payload.size() < 12 || d.expanded == 0 ||
+            d.expanded > uint32_t(kMaxChunkExpand) || d.opCount == 0) {
+            err = "bad editor chunk";
+            return false;
+        }
+        ChunkOut c;
+        c.payload.b.assign(d.payload.begin(), d.payload.end());
+        c.firstEvent = d.firstEvent;
+        c.firstTimeUs = d.firstTimeUs;
+        c.lastTimeUs = d.lastTimeUs;
+        c.expanded = d.expanded;
+        c.opCount = d.opCount;
+        outs.push_back(std::move(c));
+    }
+    // patternCount is encoded in the pattern section itself; parse it back
+    // so the header stays consistent with what readers will see.
+    Cur pc{patSection.data(), patSection.data() + patSection.size()};
+    const uint64_t patternCount = pc.u32();
+    if (!pc.ok) { err = "bad pattern section"; return false; }
+    return writeRaidDone(path, patSection, outs, logicalEvents, literalEvents,
+                         patternCount, uniqueEvents, uniqueNotes, metaJson,
+                         opt, statsOut, err);
+}
+
 // ------------------------------------------------------- FL Studio ------
 
 // Largest event count one pattern-instance op may expand to. Chunks reject
@@ -2313,6 +2352,35 @@ bool Reader::uniqueStats(uint64_t& events, uint64_t& notes, std::string& err) {
     if (!impl_->loadPatterns(err)) return false;
     events = impl_->patUniqueEvents_;
     notes = impl_->patUniqueNotes_;
+    return true;
+}
+
+bool Reader::patternBlob(std::vector<char>& out, std::string& err) {
+    if (!impl_ || !impl_->f_) { err = "reader not open"; return false; }
+    if (!impl_->loadPatterns(err)) return false;
+    out = impl_->patternBlob_;
+    return true;
+}
+
+bool Reader::patternRecs(std::vector<PatternRec>& out, std::string& err) {
+    if (!impl_ || !impl_->f_) { err = "reader not open"; return false; }
+    if (!impl_->loadPatterns(err)) return false;
+    out = impl_->patterns_;
+    return true;
+}
+
+bool Reader::chunkPayloadRaw(size_t i, std::vector<char>& out, std::string& err) {
+    if (!impl_ || !impl_->f_) { err = "reader not open"; return false; }
+    Impl& im = *impl_;
+    if (i >= im.chunks_.size()) { err = "chunk index out of range"; return false; }
+    const ChunkEnt& e = im.chunks_[i];
+    const bool compressed = (e.flags & 1) != 0;
+    if (!im.readSection(e.offset, compressed ? e.storedSize : 0, e.rawSize, compressed, out, err))
+        return false;
+    if (out.size() < 12 || crcOf(out.data(), out.size()) != e.crc) {
+        err = "chunk checksum mismatch";
+        return false;
+    }
     return true;
 }
 

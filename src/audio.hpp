@@ -125,7 +125,7 @@ private:
 
 // Procedurally generated sound effects.
 enum class Sfx { Scroll, Confirm, Cancel, Hit, Miss, Mine, Count3, Count2, Count1, CountGo, Death, Unlock, kCount };
-void sfxInit();
+void sfxInit(const std::string& base);
 void sfxShutdown();
 void sfxPlay(Sfx s, float volume = 1.0f, float pitch = 1.0f);
 void sfxSetVolume(float v);

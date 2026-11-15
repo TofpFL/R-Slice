@@ -487,6 +487,27 @@ struct SfxSlot {
 SfxSlot g_sfx[int(Sfx::kCount)];
 float g_sfxVol = 0.7f;
 
+// Loads a sound effect from an audio file (P-Slice's .ogg menu/countdown
+// set) into the base slot; returns false when the file cannot be read so the
+// caller can fall back to the synthesized sound.
+bool loadFileSlot(Sfx id, const std::string& path) {
+    Pcm pcm;
+    std::string err;
+    if (!loadAudioFile(path, pcm, err) || pcm.data.empty()) return false;
+    Wave w{};
+    w.frameCount = unsigned(pcm.frames());
+    w.sampleRate = Mixer::kRate;
+    w.sampleSize = 16;
+    w.channels = unsigned(pcm.channels);
+    w.data = const_cast<int16_t*>(pcm.data.data());
+    SfxSlot& slot = g_sfx[int(id)];
+    slot.base = LoadSoundFromWave(w);
+    if (!IsSoundValid(slot.base)) return false;
+    for (auto& a : slot.alias) a = LoadSoundAlias(slot.base);
+    slot.ok = true;
+    return true;
+}
+
 void loadSlot(Sfx id, const synth::Stereo& s) {
     std::vector<int16_t> mono(s.size());
     float peak = 1e-6f;
@@ -508,16 +529,20 @@ void loadSlot(Sfx id, const synth::Stereo& s) {
 }
 }  // namespace
 
-void sfxInit() {
+void sfxInit(const std::string& base) {
     if (!IsAudioDeviceReady()) return;
     using namespace synth;
     auto buf = [](double sec) { return Stereo(size_t(sec * SR)); };
-    {
+    // P-Slice's own menu and countdown sounds (assets/sounds/*.ogg) replace
+    // the synthesized defaults when present; synth stays as the fallback.
+    const std::string sd = base + "assets/sounds/";
+    auto pslice = [&](Sfx id, const char* name) { return loadFileSlot(id, sd + name + ".ogg"); };
+    if (!pslice(Sfx::Scroll, "scrollMenu")) {
         Stereo s = buf(0.12);
         bell(s, nullptr, 0, 96, 0.5f, 0);
         loadSlot(Sfx::Scroll, s);
     }
-    {
+    if (!pslice(Sfx::Confirm, "confirmMenu")) {
         Stereo s = buf(1.2);
         bell(s, nullptr, 0, 76, 0.8f, -0.2f);
         bell(s, nullptr, 0.05, 79, 0.7f, 0.2f);
@@ -525,13 +550,13 @@ void sfxInit() {
         bell(s, nullptr, 0.15, 88, 0.6f, 0);
         loadSlot(Sfx::Confirm, s);
     }
-    {
+    if (!pslice(Sfx::Cancel, "cancelMenu")) {
         Stereo s = buf(0.35);
         pluck(s, nullptr, 0, 0.08, 69, 0.9f, 0, 1);
         pluck(s, nullptr, 0.08, 0.12, 62, 0.9f, 0, 1);
         loadSlot(Sfx::Cancel, s);
     }
-    {
+    if (!pslice(Sfx::Hit, "hitsound")) {
         Stereo s = buf(0.08);
         for (size_t i = 0; i < s.size(); ++i) {
             const double t = double(i) / SR;
@@ -540,7 +565,7 @@ void sfxInit() {
         }
         loadSlot(Sfx::Hit, s);
     }
-    {
+    if (!pslice(Sfx::Miss, "missnote1")) {
         Stereo s = buf(0.35);
         tom(s, nullptr, 0, 95, 0.9f);
         snare(s, nullptr, 0.0, 0.25f);
@@ -556,20 +581,23 @@ void sfxInit() {
         }
         loadSlot(Sfx::Mine, s);
     }
+    const char* cntName[3] = {"intro3", "intro2", "intro1"};
     const double cnt[3] = {69, 71, 74};
     for (int k = 0; k < 3; ++k) {
+        Sfx id = Sfx(int(Sfx::Count3) + k);
+        if (pslice(id, cntName[k])) continue;
         Stereo s = buf(1.0);
         bell(s, nullptr, 0, cnt[k], 0.9f, 0);
         bell(s, nullptr, 0, cnt[k] + 12, 0.4f, 0);
-        loadSlot(Sfx(int(Sfx::Count3) + k), s);
+        loadSlot(id, s);
     }
-    {
+    if (!pslice(Sfx::CountGo, "introGo")) {
         Stereo s = buf(2.0);
         for (int n : {62, 66, 69, 74, 78}) bell(s, nullptr, 0, n, 0.7f, 0);
         crash(s, nullptr, 0, 0.6f);
         loadSlot(Sfx::CountGo, s);
     }
-    {
+    if (!pslice(Sfx::Death, "fnf_loss_sfx")) {
         Stereo s = buf(3.0);
         impact(s, nullptr, 0, 1.0f);
         padNote(s, nullptr, 0.1, 2.0, 38, 1.0f, 3, 0);

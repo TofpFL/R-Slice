@@ -11,10 +11,12 @@
 // the mouse. Event editor: custom events (custom_events/<name>.txt and .lua)
 // from a template. Files keep the fields the editors do not know.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <memory>
 #include <set>
@@ -23,6 +25,7 @@
 #include "basegame.hpp"
 #include "common.hpp"
 #include "editor_ui.hpp"
+#include "effects.hpp"
 #include "gfx.hpp"
 #include "json.hpp"
 #include "lua_host.hpp"
@@ -31,6 +34,7 @@
 #include "raylib.h"
 #include "scene.hpp"
 #include "scene_draw.hpp"
+#include "visuals.hpp"
 
 namespace gh {
 
@@ -460,8 +464,8 @@ public:
         App& a = app();
         Input& in = a.input;
         const int mods = int(modChoices().size());
-        if (in.up()) { sel_ = (sel_ + 3) % 4; sfxPlay(Sfx::Scroll); }
-        if (in.down()) { sel_ = (sel_ + 1) % 4; sfxPlay(Sfx::Scroll); }
+        if (in.up()) { sel_ = (sel_ + 5) % 6; sfxPlay(Sfx::Scroll); }
+        if (in.down()) { sel_ = (sel_ + 1) % 6; sfxPlay(Sfx::Scroll); }
         if ((in.left() || in.right()) && mods > 1) {
             int& m = modIndex();
             m = ((m + (in.left() ? -1 : 1)) % mods + mods) % mods;
@@ -478,7 +482,9 @@ public:
             case 0: openChartEditor(); break;
             case 1: a.change(makeCharacterEditor()); break;
             case 2: a.change(makeStageEditor()); break;
-            default: a.change(makeEventEditor()); break;
+            case 3: a.change(makeEventEditor()); break;
+            case 4: a.change(makeVisualsEditor()); break;
+            default: a.change(makeModchartEditor()); break;
         }
     }
     void draw() override {
@@ -486,14 +492,16 @@ public:
         gfx::beginCanvas();
         drawMenuBackground(a.now, 0x6C8CFF, menuPulse());
         gfx::text(FontId::Title, "EDITORS", gfx::W / 2, 60, 64, kGold, Align::Center, 2.0f);
-        static const char* items[4] = {"Chart Editor", "Character Editor", "Stage Editor", "Event Editor"};
-        static const char* about[4] = {"A song of this mod (the one chosen in Freeplay if it is here)",
+        static const char* items[6] = {"Chart Editor", "Character Editor", "Stage Editor", "Event Editor", "Visuals Editor", "Modchart Editor"};
+        static const char* about[6] = {"A song of this mod (the one chosen in Freeplay if it is here)",
                                        "Animations, offsets, image, icon and colours of a character",
                                        "Zoom, where the characters stand and what the camera sees",
-                                       "New events for charts: a description and a Lua script"};
-        for (int i = 0; i < 4; ++i) {
+                                       "New events for charts: a description and a Lua script",
+                                       "Timed shader/FX clips for a song: post effects on playfield and receptors",
+                                       "Codename-style modifier tracks: cameras, characters, notes, receptors and shader clips"};
+        for (int i = 0; i < 6; ++i) {
             const bool on = i == sel_;
-            const float y = 190.0f + i * 92.0f;
+            const float y = 175.0f + i * 80.0f;
             gfx::text(FontId::Title, items[i], gfx::W / 2, y, on ? 54.0f : 44.0f, on ? kGold : fade(kIvory, 0.55f), Align::Center, 2.0f);
             if (on) gfx::text(FontId::Ui, about[i], gfx::W / 2, y + 58, 20, fade(kIvory, 0.85f), Align::Center, 1.5f);
         }
@@ -1599,11 +1607,1180 @@ private:
     }
 };
 
+// ======================================================== visuals editor ==
+// visuals.json: timed shader/FX clips for one song (the .RAID stays notes-
+// only). Left: the clip list. Centre: a live preview - the song's audio
+// through the mixer, a demo playfield through the active shader chain.
+// Right: the selected clip's timing, target camera, effect and uniforms.
+
+class VisualsEditorState : public State {
+public:
+    // Opened from a song (key 8 in gameplay): start on that song/diff.
+    void openFor(const std::string& songId, const std::string& diff) {
+        wantSongId_ = songId;
+        wantDiff_ = diff;
+    }
+
+    void enter() override {
+        mod_ = currentMod();
+        useMod(sc_, mod_);
+        buildSongList();
+        int pick = -1;
+        if (!wantSongId_.empty()) {
+            const auto& songs = app().library.songs();
+            for (int idx : songIdx_)
+                if (songs[size_t(idx)].id == wantSongId_) { pick = idx; break; }
+        }
+        if (pick < 0) pick = freeplayPick_ >= 0 ? freeplayPick_ : (songIdx_.empty() ? -1 : songIdx_[0]);
+        pickSong(pick, wantDiff_);
+    }
+    bool keyReserved(int key) const override {
+        return !ui_.focus.empty() || key == KEY_SPACE;
+    }
+    TouchLayout touchLayout() const override {
+        TouchLayout t;
+        t.pad = false;
+        if (audioReady_) t.keys = {{"PLAY", KEY_SPACE}, {"SAVE", KEY_F2}, {"BACK", KEY_ESCAPE}};
+        return t;
+    }
+
+    void update(double dt) override {
+        App& a = app();
+        Input& in = a.input;
+        feedUi(ui_);
+        if (job_.valid()) {
+            if (job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                Prepared p = job_.get();
+                if (p.ok) {
+                    prep_ = std::move(p);
+                    audioReady_ = true;
+                    a.mixer.setTracks(prep_.inst, prep_.voiceP, prep_.voiceO);
+                    a.mixer.setRate(1.0);
+                    dirty_ = false;
+                } else {
+                    status_.set(p.error.empty() ? "cannot load the song" : p.error, true);
+                }
+            }
+            return;
+        }
+        if (!audioReady_) {
+            if (in.back()) exitEditor();
+            return;
+        }
+        if (playing_) {
+            curMs_ = a.mixer.time(a.now) * 1000.0;
+            if (a.mixer.ended() || curMs_ > songLenMs() + 1500) {
+                a.mixer.pause();
+                playing_ = false;
+                curMs_ = songLenMs();
+            }
+        }
+        sc_.update(dt, chartStepMs(), false);  // keeps shader clocks alive
+        if (in.pressed(KEY_SPACE)) togglePlay();
+        if (in.pressed(KEY_F2)) save();
+        if (in.pressed(KEY_ESCAPE)) {
+            if (dirty_ && !leaveArmed_) {
+                status_.set("Unsaved changes: ESC again to leave without saving (F2 saves)", true);
+                leaveArmed_ = true;
+            } else {
+                exitEditor();
+            }
+        }
+        syncFields();
+    }
+
+    void draw() override {
+        App& a = app();
+        gfx::beginCanvas();
+        drawMenuBackground(a.now, 0x6C8CFF, 0);
+        DrawRectangleRec({0, 0, gfx::W, gfx::H}, fade(BLACK, 0.45f));
+        gfx::text(FontId::Title, "VISUALS EDITOR", 40, 18, 40, kGold, Align::Left, 2.0f);
+        drawHeader();
+        if (!audioReady_) {
+            gfx::text(FontId::Ui, "Loading " + (song_ ? song_->title : std::string("song")) + "...", gfx::W / 2, gfx::H / 2, 26, kIvory, Align::Center);
+            hints("ESC back");
+            ui_.overlays();
+            status_.draw();
+            gfx::endCanvas();
+            return;
+        }
+        drawClipList();
+        drawPreview();
+        drawTimeline();
+        drawFields();
+        ui_.overlays();
+        hints("SPACE play/pause   Click timeline: seek / select clip   F2 save   ESC back");
+        status_.draw();
+        gfx::endCanvas();
+    }
+
+private:
+    scene::Scene sc_;
+    SceneRenderer renderer_;
+    Ui ui_;
+    Status status_;
+    ModChoice mod_;
+    std::vector<int> songIdx_;       // indices into library.songs()
+    int songPos_ = 0;
+    const SongEntry* song_ = nullptr;
+    std::string diff_;
+    std::future<Prepared> job_;
+    Prepared prep_;
+    bool audioReady_ = false, playing_ = false, dirty_ = false, leaveArmed_ = false;
+    double curMs_ = 0;
+    std::vector<VisualClip> clips_;
+    std::string visualsPath_;
+    int sel_ = -1;
+    // Selected clip's editable fields (strings; synced both ways).
+    std::string fStart_, fEnd_;
+    int fTarget_ = 0, fFx_ = 0;
+    std::vector<std::pair<std::string, std::string>> fParams_;
+    std::vector<std::string> fxNames_;
+    RenderTexture2D prevRt_{};
+    float scroll_ = 0;
+    int syncSel_ = -2;
+    size_t syncN_ = ~size_t(0);
+
+    int freeplayPick_ = -1;
+    std::string wantSongId_, wantDiff_;
+
+    void buildSongList() {
+        const auto& songs = app().library.songs();
+        for (int i = 0; i < int(songs.size()); ++i) {
+            const SongEntry& e = songs[size_t(i)];
+            if (e.builtin || e.diffs.empty()) continue;
+            if (wantSongId_.empty() && !mod_.name.empty() && e.pack != mod_.name) continue;
+            songIdx_.push_back(i);
+        }
+        if (songIdx_.empty()) {
+            for (int i = 0; i < int(songs.size()); ++i)
+                if (!songs[size_t(i)].builtin && !songs[size_t(i)].diffs.empty()) songIdx_.push_back(i);
+        }
+        // The song chosen in Freeplay wins when it is in this mod.
+        const int fp = app().freeplaySel;
+        if (fp >= 0 && fp < int(songs.size()) && !songs[size_t(fp)].builtin &&
+            (mod_.name.empty() || songs[size_t(fp)].pack == mod_.name))
+            freeplayPick_ = fp;
+    }
+
+    void pickSong(int libIdx, const std::string& diff = "") {
+        const auto& songs = app().library.songs();
+        if (libIdx < 0 || libIdx >= int(songs.size())) return;
+        auto it = std::find(songIdx_.begin(), songIdx_.end(), libIdx);
+        songPos_ = it != songIdx_.end() ? int(it - songIdx_.begin()) : 0;
+        song_ = &songs[size_t(libIdx)];
+        diff_ = diff;
+        if (diff_.empty() || std::find(song_->diffs.begin(), song_->diffs.end(), diff_) == song_->diffs.end())
+            diff_ = song_->diffs.empty() ? "" : song_->diffs.front();
+        fxNames_ = fx::names();
+        for (const std::string& n : customShaders()) fxNames_.push_back(n);
+        loadClips();
+        const SongEntry copy = *song_;
+        const std::string d = diff_;
+        job_ = std::async(std::launch::async, [copy, d] { return app().library.prepare(copy, d, false); });
+        audioReady_ = false;
+        playing_ = false;
+        sel_ = -1;
+        fParams_.clear();
+    }
+
+    void cycleSong(int d) {
+        if (songIdx_.empty() || job_.valid()) return;
+        songPos_ = ((songPos_ + d) % int(songIdx_.size()) + int(songIdx_.size())) % int(songIdx_.size());
+        pickSong(songIdx_[size_t(songPos_)]);
+    }
+
+    std::string visualsFile() const { return song_ && !song_->dataDir.empty() ? song_->dataDir + "/visuals.json" : ""; }
+
+    void loadClips() {
+        clips_.clear();
+        visualsPath_ = visualsFile();
+        std::string text;
+        if (!visualsPath_.empty() && scene::readFile(visualsPath_, text)) {
+            std::string err;
+            if (!parseVisuals(text, clips_, err)) status_.set("visuals.json: " + err, true);
+        }
+        dirty_ = false;
+        leaveArmed_ = false;
+    }
+
+    double songLenMs() const {
+        double len = prep_.chart.lengthMs;
+        if (prep_.inst) len = std::max(len, double(prep_.inst->frames()) * 1000.0 / Mixer::kRate);
+        return std::max(1000.0, len);
+    }
+
+    double chartStepMs() const { return prep_.chart.tempo.empty() ? 500.0 : prep_.chart.stepMs(std::max(0.0, curMs_)); }
+
+    void togglePlay() {
+        App& a = app();
+        if (playing_) {
+            a.mixer.pause();
+            playing_ = false;
+            return;
+        }
+        a.mixer.setTracks(prep_.inst, prep_.voiceP, prep_.voiceO);
+        a.mixer.setRate(1.0);
+        a.mixer.play(std::max(0.0, curMs_) / 1000.0);
+        playing_ = true;
+    }
+
+    void seek(double ms) {
+        curMs_ = clampv(ms, 0.0, songLenMs());
+        app().mixer.seek(curMs_ / 1000.0);  // works paused and playing
+    }
+
+
+    // .frag files shipped with the song or visible in its asset roots.
+    std::vector<std::string> customShaders() {
+        std::vector<std::string> out;
+        std::set<std::string> seen;
+        auto scan = [&](const std::string& dir) {
+            std::error_code ec;
+            for (const auto& e : fs::directory_iterator(toPath(dir), ec)) {
+                if (!e.is_regular_file(ec)) continue;
+                std::string n = pathStr(e.path().filename());
+                const std::string ext = pathStr(e.path().extension());
+                if (!equalsI(ext, ".frag") && !equalsI(ext, ".glsl")) continue;
+                if (n.size() > ext.size()) n.resize(n.size() - ext.size());
+                if (seen.insert(n).second) out.push_back(n);
+            }
+        };
+        if (song_) {
+            scan(song_->dataDir + "/shaders");
+            scan(song_->dataDir);
+            for (const std::string& r : song_->assetRoots) scan(r + "shaders");
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    // Resolves a clip's fx name to a shader source in the editor's scene.
+    bool ensureShaderSource(const std::string& fxName, std::string& nameOut) {
+        std::string name = fxName;
+        if (fx::source(name).empty() && name.rfind("__fx_", 0) != 0 && !fx::source("__fx_" + name).empty())
+            name = "__fx_" + name;
+        if (!fx::source(name).empty()) {
+            fx::install(sc_, name);
+            nameOut = name;
+            return true;
+        }
+        if (sc_.shaderSources.count(name)) { nameOut = name; return true; }
+        // Custom: shaders/<name>.frag in the song folder or asset roots.
+        std::vector<std::string> tries;
+        if (song_) {
+            tries.push_back(song_->dataDir + "/shaders/" + name + ".frag");
+            tries.push_back(song_->dataDir + "/" + name);
+            for (const std::string& r : song_->assetRoots) tries.push_back(r + "shaders/" + name + ".frag");
+        }
+        for (const ModChoice& m : modChoices())
+            for (const std::string& r : m.roots) tries.push_back(r + "shaders/" + name + ".frag");
+        for (const std::string& p : tries) {
+            scene::ShaderSource src;
+            if (!scene::readFile(p, src.frag) || src.frag.empty()) continue;
+            const std::string vp = p.substr(0, p.size() - 5) + ".vert";
+            scene::readFile(vp, src.vert);
+            sc_.shaderSources[name] = std::move(src);
+            nameOut = name;
+            return true;
+        }
+        return false;
+    }
+
+    // Shader chain active at curMs_, as ShaderInstances for drawFiltered.
+    std::vector<scene::ShaderPtr> activeShaders() {
+        std::vector<scene::ShaderPtr> out;
+        for (const VisualClip& c : clips_) {
+            const bool open = c.endMs <= c.startMs || curMs_ < c.endMs;
+            if (!(curMs_ >= c.startMs && open)) continue;
+            std::string name;
+            if (!ensureShaderSource(c.fx, name)) continue;
+            auto inst = std::make_shared<scene::ShaderInstance>();
+            inst->name = name;
+            inst->timeName = "uTime";
+            inst->floats["uTime"] = {float(app().now)};
+            inst->timeRate = 0;  // uTime is set per frame above
+            for (const auto& [k, v] : c.params) inst->floats[k] = {float(v)};
+            out.push_back(inst);
+        }
+        return out;
+    }
+
+    void drawDemoPlayfield() {
+        // A stand-in for the playfield: dark stage, lane strips, receptors and
+        // falling blocks - enough for shaders to have something to chew on.
+        DrawRectangleRec({0, 0, float(prevRt_.texture.width), float(prevRt_.texture.height)}, Color{16, 12, 26, 255});
+        const float w = float(prevRt_.texture.width), h = float(prevRt_.texture.height);
+        const int lanes = prep_.chart.keys > 0 ? prep_.chart.keys : 4;
+        const float lw = w / float(lanes);
+        const double t = app().now;
+        for (int side = 0; side < 2; ++side) {
+            const float base = side == 0 ? 0.0f : w * 0.5f;
+            const float lw2 = w * 0.5f / float(lanes);
+            for (int l = 0; l < lanes; ++l) {
+                const float x = base + l * lw2;
+                DrawRectangleRec({x + 2, h * 0.08f, lw2 - 4, h * 0.84f}, Color{30, 24, 48, 255});
+                // receptors
+                const float ry = side == 0 ? h * 0.9f : h * 0.1f;
+                DrawRectangleRec({x + lw2 * 0.22f, ry - 8, lw2 * 0.56f, 16},
+                                 side == 0 ? Color{120, 200, 255, 220} : Color{255, 120, 160, 220});
+                // a few falling notes per lane, looping
+                for (int n = 0; n < 3; ++n) {
+                    const double ph = std::fmod(t * 0.35 + double(l * 7 + n * 13 + side * 31), 3.0);
+                    const float ny = float(ph / 3.0) * h * 0.8f + h * 0.05f;
+                    DrawRectangleRec({x + lw2 * 0.3f, ny, lw2 * 0.4f, 10},
+                                     side == 0 ? Color{90, 170, 255, 255} : Color{255, 110, 140, 255});
+                }
+            }
+        }
+    }
+
+    void drawHeader() {
+        const float y = 66;
+        if (ui_.button({gfx::W - 330, y - 6, 60, 30}, "<")) cycleSong(-1);
+        if (ui_.button({gfx::W - 264, y - 6, 60, 30}, ">")) cycleSong(1);
+        const std::string label = song_ ? song_->title + "  (" + diff_ + ")" : "no song";
+        gfx::text(FontId::Ui, label, gfx::W - 196, y, 20, kIvory, Align::Right);
+        gfx::text(FontId::Ui, "visuals.json - shader clips for this song", 40, y, 18, kDim);
+        if (ui_.button({gfx::W - 560, y - 6, 90, 30}, "Add clip")) addClip();
+        if (ui_.button({gfx::W - 460, y - 6, 80, 30}, "Delete")) delClip();
+        if (ui_.button({gfx::W - 120, y - 6, 100, 30}, "Save (F2)")) save();
+    }
+
+    Color targetColor(const std::string& t) const {
+        if (t == "hud") return Color{90, 160, 255, 255};
+        if (t == "both") return Color{120, 220, 140, 255};
+        return Color{200, 130, 255, 255};
+    }
+
+    void drawClipList() {
+        const Rectangle box{40, 110, 380, gfx::H - 190};
+        DrawRectangleRounded(box, 0.02f, 6, kPanel);
+        gfx::text(FontId::Ui, "CLIPS", box.x + 12, box.y + 6, 16, kDim);
+        const float row = 30;
+        const int rows = int((box.height - 40) / row), n = int(clips_.size());
+        if (CheckCollisionPointRec(ui_.mouse, box) && ui_.wheel != 0)
+            scroll_ = clampv(scroll_ - ui_.wheel * 3, 0.0f, float(std::max(0, n - rows)));
+        if (n == 0) gfx::text(FontId::Ui, "No clips yet - Add clip", box.x + 12, box.y + 30, 18, kDim);
+        const int first = int(scroll_);
+        for (int k = 0; k < rows && first + k < n; ++k) {
+            const int i = first + k;
+            const VisualClip& c = clips_[size_t(i)];
+            const Rectangle r{box.x + 4, box.y + 30 + k * row, box.width - 8, row - 3};
+            const bool hov = ui_.hover(r);
+            if (i == sel_ || hov) DrawRectangleRec(r, i == sel_ ? Color{90, 66, 140, 255} : Color{50, 38, 76, 255});
+            DrawRectangleRec({r.x + 4, r.y + 5, 8, r.height - 10}, targetColor(c.target));
+            const std::string fxName = c.fx.rfind("__fx_", 0) == 0 ? c.fx.substr(5) : c.fx;
+            gfx::text(FontId::Ui, TextFormat("%d. %.1f-%.1fs  %s", i + 1, c.startMs / 1000.0,
+                                            c.endMs > c.startMs ? c.endMs / 1000.0 : -1.0, fxName.c_str()),
+                      r.x + 20, r.y + 4, 17, kInk);
+            if (hov && ui_.click) {
+                ui_.used = true;
+                selectClip(i);
+            }
+        }
+    }
+
+    void drawPreview() {
+        const Rectangle vp{430, 110, 560, 315};
+        DrawRectangleRounded(vp, 0.02f, 6, kPanel);
+        gfx::text(FontId::Ui, "PREVIEW", vp.x + 12, vp.y + 6, 16, kDim);
+        if (!prevRt_.id || prevRt_.texture.width != int(vp.width) || prevRt_.texture.height != int(vp.height)) {
+            if (prevRt_.id) UnloadRenderTexture(prevRt_);
+            prevRt_ = LoadRenderTexture(int(vp.width), int(vp.height));
+        }
+        // Texture mode can't nest inside the canvas camera (play_psych does
+        // texture-outermost too): leave Mode2D, render the demo playfield and
+        // the shader chain in screen space, then resume the canvas.
+        gfx::endCanvas();
+        gfx::beginTexture(prevRt_);
+        ClearBackground(BLANK);
+        drawDemoPlayfield();
+        gfx::endTexture();
+        std::vector<scene::ShaderPtr> chain = activeShaders();
+        const float cs = gfx::canvasScale();
+        const Vector2 co = gfx::canvasOrigin();
+        renderer_.drawFiltered(sc_, chain, prevRt_,
+                               Rectangle{co.x + vp.x * cs, co.y + vp.y * cs, vp.width * cs, vp.height * cs});
+        gfx::beginCanvas();
+        DrawRectangle(vp.x, vp.y, vp.width, 2, fade(kGold, 0.5f));
+        // transport row under the viewport
+        const float ty = vp.y + vp.height + 10;
+        if (ui_.button({vp.x, ty, 90, 30}, playing_ ? "Pause" : "Play")) togglePlay();
+        if (ui_.button({vp.x + 100, ty, 70, 30}, "Stop")) { seek(0); if (playing_) { app().mixer.pause(); playing_ = false; } }
+        if (ui_.button({vp.x + 180, ty, 150, 30}, "Preview song")) previewSong();
+        gfx::text(FontId::Ui, TextFormat("%.2f / %.2f s", curMs_ / 1000.0, songLenMs() / 1000.0),
+                  vp.x + 340, ty + 5, 20, kIvory);
+    }
+
+    void drawTimeline() {
+        const Rectangle tl{430, 470, 560, 34};
+        DrawRectangleRounded(tl, 0.02f, 6, Color{24, 20, 34, 255});
+        const double len = songLenMs();
+        auto xOf = [&](double ms) { return tl.x + float(ms / len) * tl.width; };
+        // ticks every ~10 s
+        for (double s = 0; s <= len / 1000.0; s += 10) {
+            const float x = xOf(s * 1000.0);
+            DrawLineEx({x, tl.y + tl.height - 8}, {x, tl.y + tl.height}, 1, Color{70, 60, 100, 255});
+            gfx::text(FontId::Ui, TextFormat("%d", int(s)), x + 2, tl.y + 4, 13, kDim);
+        }
+        for (size_t i = 0; i < clips_.size(); ++i) {
+            const VisualClip& c = clips_[i];
+            const float x0 = xOf(c.startMs), x1 = c.endMs > c.startMs ? xOf(c.endMs) : tl.x + tl.width;
+            const bool sel = int(i) == sel_;
+            DrawRectangleRec({x0 + 1, tl.y + 8, std::max(3.0f, x1 - x0 - 2), tl.height - 18},
+                             fade(targetColor(c.target), sel ? 1.0f : 0.75f));
+        }
+        DrawLineEx({xOf(curMs_), tl.y}, {xOf(curMs_), tl.y + tl.height}, 2, kGold);
+        if (ui_.hover(tl) && ui_.click) {
+            ui_.used = true;
+            const double ms = (ui_.mouse.x - tl.x) / tl.width * len;
+            // A click on a clip selects it; on empty time it seeks.
+            int hit = -1;
+            for (size_t i = 0; i < clips_.size(); ++i) {
+                const VisualClip& c = clips_[i];
+                const float x0 = xOf(c.startMs), x1 = c.endMs > c.startMs ? xOf(c.endMs) : tl.x + tl.width;
+                if (ui_.mouse.x >= x0 && ui_.mouse.x <= x1) { hit = int(i); break; }
+            }
+            if (hit >= 0) selectClip(hit);
+            else seek(ms);
+        }
+    }
+
+    void drawFields() {
+        const float x = 1010, w = gfx::W - x - 40;
+        float y = 110;
+        DrawRectangleRounded({x - 10, y - 8, w + 20, gfx::H - 152}, 0.02f, 6, kPanel);
+        if (sel_ < 0 || sel_ >= int(clips_.size())) {
+            gfx::text(FontId::Ui, "Select a clip on the timeline or in the list.", x, y + 8, 18, kDim);
+            return;
+        }
+        VisualClip& c = clips_[size_t(sel_)];
+        const float rh = 30;
+        gfx::text(FontId::Ui, TextFormat("Clip %d", sel_ + 1), x, y, 20, kGold);
+        y += 30;
+        if (ui_.text("fstart", {x, y, w * 0.45f, rh}, "Start (s)", fStart_)) { applyFields(); dirty_ = true; }
+        if (ui_.text("fend", {x + w * 0.5f, y, w * 0.5f, rh}, "End (s, 0 = song end)", fEnd_)) { applyFields(); dirty_ = true; }
+        y += rh + 8;
+        static const char* tnames[3] = {"game (playfield)", "hud (receptors)", "both"};
+        if (ui_.dropdown("ftarget", {x, y, w, rh}, "Camera", {tnames[0], tnames[1], tnames[2]}, fTarget_)) { applyFields(); dirty_ = true; }
+        y += rh + 8;
+        std::vector<std::string> opts = fxNames_;
+        if (std::find(opts.begin(), opts.end(), c.fx) == opts.end()) opts.insert(opts.begin(), c.fx);
+        if (ui_.dropdown("ffx", {x, y, w, rh}, "Effect", opts, fFx_)) { applyFields(); dirty_ = true; }
+        y += rh + 12;
+        gfx::text(FontId::Ui, "Uniforms (float)", x, y, 17, kDim);
+        y += 24;
+        for (size_t i = 0; i < fParams_.size(); ++i) {
+            if (ui_.text("pk" + std::to_string(i), {x, y, w * 0.5f - 34, rh}, "", fParams_[i].first)) { applyFields(); dirty_ = true; }
+            if (ui_.text("pv" + std::to_string(i), {x + w * 0.5f - 28, y, w * 0.5f - 60, rh}, "", fParams_[i].second)) { applyFields(); dirty_ = true; }
+            if (ui_.button({x + w - 30, y + 3, 26, rh - 6}, "x")) {
+                fParams_.erase(fParams_.begin() + i);
+                applyFields();
+                dirty_ = true;
+                break;
+            }
+            y += rh + 6;
+            if (y > gfx::H - 120) break;
+        }
+        if (y < gfx::H - 120 && ui_.button({x, y, 140, rh}, "+ uniform")) {
+            fParams_.push_back({"uStrength", "0.5"});
+            applyFields();
+            dirty_ = true;
+        }
+    }
+
+    void selectClip(int i) {
+        sel_ = i;
+        syncFields();
+    }
+
+    // Fields -> clip (called when a field reports a change and each draw for
+    // the param rows, which have no change callback of their own).
+    void applyFields() {
+        if (sel_ < 0 || sel_ >= int(clips_.size())) return;
+        VisualClip& c = clips_[size_t(sel_)];
+        try {
+            c.startMs = std::max(0.0, std::atof(fStart_.c_str()) * 1000.0);
+            const double e = std::atof(fEnd_.c_str());
+            c.endMs = e > 0 ? c.startMs + e * 1000.0 : 0;
+        } catch (...) {}
+        c.target = fTarget_ == 1 ? "hud" : fTarget_ == 2 ? "both" : "game";
+        if (fFx_ >= 0 && fFx_ < int(fxNames_.size())) c.fx = fxNames_[size_t(fFx_)];
+        c.params.clear();
+        for (const auto& [k, v] : fParams_) {
+            try {
+                c.params[k] = std::stod(v);
+            } catch (...) {}
+        }
+    }
+
+    // Clip -> fields when the selection changes.
+    void syncFields() {
+        if (sel_ == syncSel_ && clips_.size() == syncN_) return;
+        syncSel_ = sel_;
+        syncN_ = clips_.size();
+        if (sel_ < 0 || sel_ >= int(clips_.size())) return;
+        const VisualClip& c = clips_[size_t(sel_)];
+        fStart_ = TextFormat("%.3f", c.startMs / 1000.0);
+        fEnd_ = c.endMs > c.startMs ? TextFormat("%.3f", (c.endMs - c.startMs) / 1000.0) : "0";
+        fTarget_ = c.target == "hud" ? 1 : c.target == "both" ? 2 : 0;
+        fFx_ = 0;
+        for (size_t i = 0; i < fxNames_.size(); ++i)
+            if (fxNames_[i] == c.fx || "__fx_" + fxNames_[i] == c.fx) { fFx_ = int(i); break; }
+        fParams_.clear();
+        for (const auto& [k, v] : c.params) fParams_.push_back({k, TextFormat("%g", v)});
+    }
+
+    void addClip() {
+        VisualClip c;
+        c.startMs = curMs_;
+        c.endMs = 0;
+        c.target = "game";
+        c.fx = fxNames_.empty() ? "__fx_glitch" : fxNames_[0];
+        clips_.push_back(c);
+        sel_ = int(clips_.size()) - 1;
+        dirty_ = true;
+        syncFields();
+    }
+
+    void delClip() {
+        if (sel_ < 0 || sel_ >= int(clips_.size())) return;
+        clips_.erase(clips_.begin() + sel_);
+        sel_ = -1;
+        dirty_ = true;
+    }
+
+    // The real song with visuals.json live: notes hidden, characters and
+    // cameras play normally (botplay hits the notes for it).
+    void previewSong() {
+        if (!song_ || !audioReady_) return;
+        App& a = app();
+        PlayRequest req;
+        req.songId = song_->id;
+        req.diff = diff_;
+        req.visualsOnly = true;
+        a.change(makePlay(req));
+    }
+
+    // Back to the song when opened from gameplay (key 8), else the menu.
+    void exitEditor() {
+        App& a = app();
+        if (a.visualsReturn) {
+            const PlayRequest req = *a.visualsReturn;
+            a.visualsReturn.reset();
+            a.change(makePlay(req));
+            return;
+        }
+        a.change(makeEditorMenu());
+    }
+
+    void save() {
+        if (visualsPath_.empty()) { status_.set("This song has no folder for visuals.json", true); return; }
+        applyFields();
+        const std::string json = visualsJson(clips_);
+        std::string err;
+        if (!saveText(visualsPath_, json, err)) { status_.set(err, true); return; }
+        dirty_ = false;
+        leaveArmed_ = false;
+        status_.set("Saved " + visualsPath_);
+    }
+};
+
 }  // namespace
 
 std::unique_ptr<State> makeEditorMenu() { return std::make_unique<EditorMenuState>(); }
 std::unique_ptr<State> makeCharacterEditor() { return std::make_unique<CharacterEditorState>(); }
 std::unique_ptr<State> makeStageEditor() { return std::make_unique<StageEditorState>(); }
 std::unique_ptr<State> makeEventEditor() { return std::make_unique<EventEditorState>(); }
+std::unique_ptr<State> makeVisualsEditor() { return std::make_unique<VisualsEditorState>(); }
+// ========================================================= modchart editor ==
+// modchart.json: Codename-style modifier tracks for one song. Left: tracks
+// and their properties. Centre: live preview (demo playfield + real audio).
+// Bottom: the timeline - one row per property, keyframes as diamonds,
+// click a lane to add a key, drag a diamond to retime it, Del removes it.
+// "Preview song" launches the real song in visualsOnly mode where the mods
+// apply live (notes hidden, characters/cameras/FX playing).
+
+class ModchartEditorState : public State {
+public:
+    void openFor(const std::string& songId, const std::string& diff) {
+        wantSongId_ = songId;
+        wantDiff_ = diff;
+    }
+
+    void enter() override {
+        mod_ = currentMod();
+        useMod(sc_, mod_);
+        buildSongList();
+        int pick = -1;
+        if (!wantSongId_.empty()) {
+            const auto& songs = app().library.songs();
+            for (int idx : songIdx_)
+                if (songs[size_t(idx)].id == wantSongId_) { pick = idx; break; }
+        }
+        if (pick < 0) pick = freeplayPick_ >= 0 ? freeplayPick_ : (songIdx_.empty() ? -1 : songIdx_[0]);
+        pickSong(pick, wantDiff_);
+    }
+    bool keyReserved(int key) const override {
+        return !ui_.focus.empty() || key == KEY_SPACE || key == KEY_DELETE;
+    }
+    TouchLayout touchLayout() const override {
+        TouchLayout t;
+        t.pad = false;
+        if (audioReady_) t.keys = {{"PLAY", KEY_SPACE}, {"SAVE", KEY_F2}, {"BACK", KEY_ESCAPE}};
+        return t;
+    }
+
+    void update(double dt) override {
+        App& a = app();
+        Input& in = a.input;
+        feedUi(ui_);
+        if (job_.valid()) {
+            if (job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                Prepared p = job_.get();
+                if (p.ok) {
+                    prep_ = std::move(p);
+                    audioReady_ = true;
+                    a.mixer.setTracks(prep_.inst, prep_.voiceP, prep_.voiceO);
+                    a.mixer.setRate(1.0);
+                    dirty_ = false;
+                } else {
+                    status_.set(p.error.empty() ? "cannot load the song" : p.error, true);
+                }
+            }
+            return;
+        }
+        if (!audioReady_) {
+            if (in.back()) exitEditor();
+            return;
+        }
+        if (playing_) {
+            curMs_ = a.mixer.time(a.now) * 1000.0;
+            if (a.mixer.ended() || curMs_ > songLenMs() + 1500) {
+                a.mixer.pause();
+                playing_ = false;
+                curMs_ = songLenMs();
+            }
+        }
+        sc_.update(dt, chartStepMs(), false);
+        // Keyframe drag: hold LMB on a diamond and move.
+        if (dragTrack_ >= 0 && dragProp_ >= 0 && dragKey_ >= 0) {
+            if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                dragTrack_ = dragProp_ = dragKey_ = -1;
+            } else {
+                const double ms = xToTime(ui_.mouse.x);
+                ModProp& mp = mc_.tracks[size_t(dragTrack_)].props[size_t(dragProp_)];
+                if (dragKey_ < int(mp.keys.size())) {
+                    mp.keys[size_t(dragKey_)].tMs = clampv(ms, 0.0, songLenMs());
+                    std::stable_sort(mp.keys.begin(), mp.keys.end(),
+                                     [](const ModKey& a, const ModKey& b) { return a.tMs < b.tMs; });
+                    dirty_ = true;
+                }
+            }
+        }
+        if (in.pressed(KEY_SPACE)) togglePlay();
+        if (in.pressed(KEY_F2)) save();
+        if (in.pressed(KEY_DELETE) && selKey_ >= 0) delKey();
+        if (in.pressed(KEY_ESCAPE)) {
+            if (dirty_ && !leaveArmed_) {
+                status_.set("Unsaved changes: ESC again to leave without saving (F2 saves)", true);
+                leaveArmed_ = true;
+            } else {
+                exitEditor();
+            }
+        }
+        clampSel();
+        const std::string sig = std::to_string(selTrack_) + "," + std::to_string(selProp_) + "," + std::to_string(selKey_);
+        if (sig != selSig_) { selSig_ = sig; syncKeyFields(); }
+    }
+
+    void draw() override {
+        App& a = app();
+        gfx::beginCanvas();
+        drawMenuBackground(a.now, 0x6C8CFF, 0);
+        DrawRectangleRec({0, 0, gfx::W, gfx::H}, fade(BLACK, 0.45f));
+        gfx::text(FontId::Title, "MODCHART EDITOR", 40, 18, 40, kGold, Align::Left, 2.0f);
+        drawHeader();
+        if (!audioReady_) {
+            gfx::text(FontId::Ui, "Loading " + (song_ ? song_->title : std::string("song")) + "...", gfx::W / 2, gfx::H / 2, 26, kIvory, Align::Center);
+            hints("ESC back");
+            ui_.overlays();
+            status_.draw();
+            gfx::endCanvas();
+            return;
+        }
+        drawTrackPanel();
+        drawPreview();
+        drawTimeline();
+        drawKeyFields();
+        ui_.overlays();
+        hints("SPACE play/pause   Timeline: click lane = add key, drag diamond = retime, DEL = delete key   F2 save   ESC back");
+        status_.draw();
+        gfx::endCanvas();
+    }
+
+private:
+    scene::Scene sc_;
+    Ui ui_;
+    Status status_;
+    ModChoice mod_;
+    std::vector<int> songIdx_;
+    int songPos_ = 0;
+    const SongEntry* song_ = nullptr;
+    std::string diff_;
+    std::future<Prepared> job_;
+    Prepared prep_;
+    bool audioReady_ = false, playing_ = false, dirty_ = false, leaveArmed_ = false;
+    double curMs_ = 0;
+    Modchart mc_;
+    std::string mcPath_;
+    int selTrack_ = -1, selProp_ = -1, selKey_ = -1;
+    int dragTrack_ = -1, dragProp_ = -1, dragKey_ = -1;
+    int addTarget_ = 0;
+    std::string fT_, fV_;
+    int fEaseIdx_ = 0;
+    std::string wantSongId_, wantDiff_;
+    int freeplayPick_ = -1;
+    std::string selSig_;
+
+    static const char* kEaseNames[5];
+
+    // ---- song / file plumbing (same shape as the Visuals Editor) ----
+
+    void buildSongList() {
+        const auto& songs = app().library.songs();
+        for (int i = 0; i < int(songs.size()); ++i) {
+            const SongEntry& e = songs[size_t(i)];
+            if (e.builtin || e.diffs.empty()) continue;
+            if (wantSongId_.empty() && !mod_.name.empty() && e.pack != mod_.name) continue;
+            songIdx_.push_back(i);
+        }
+        if (songIdx_.empty())
+            for (int i = 0; i < int(songs.size()); ++i)
+                if (!songs[size_t(i)].builtin && !songs[size_t(i)].diffs.empty()) songIdx_.push_back(i);
+        const int fp = app().freeplaySel;
+        if (fp >= 0 && fp < int(songs.size()) && !songs[size_t(fp)].builtin &&
+            (mod_.name.empty() || songs[size_t(fp)].pack == mod_.name))
+            freeplayPick_ = fp;
+    }
+
+    void pickSong(int libIdx, const std::string& diff = "") {
+        const auto& songs = app().library.songs();
+        if (libIdx < 0 || libIdx >= int(songs.size())) return;
+        auto it = std::find(songIdx_.begin(), songIdx_.end(), libIdx);
+        songPos_ = it != songIdx_.end() ? int(it - songIdx_.begin()) : 0;
+        song_ = &songs[size_t(libIdx)];
+        diff_ = diff;
+        if (diff_.empty() || std::find(song_->diffs.begin(), song_->diffs.end(), diff_) == song_->diffs.end())
+            diff_ = song_->diffs.empty() ? "" : song_->diffs.front();
+        loadChart();
+        const SongEntry copy = *song_;
+        const std::string d = diff_;
+        job_ = std::async(std::launch::async, [copy, d] { return app().library.prepare(copy, d, false); });
+        audioReady_ = false;
+        playing_ = false;
+        selTrack_ = selProp_ = selKey_ = -1;
+    }
+
+    void cycleSong(int d) {
+        if (songIdx_.empty() || job_.valid()) return;
+        songPos_ = ((songPos_ + d) % int(songIdx_.size()) + int(songIdx_.size())) % int(songIdx_.size());
+        pickSong(songIdx_[size_t(songPos_)]);
+    }
+
+    std::string mcFile() const { return song_ && !song_->dataDir.empty() ? song_->dataDir + "/modchart.json" : ""; }
+
+    void loadChart() {
+        mc_ = Modchart{};
+        mcPath_ = mcFile();
+        std::string text;
+        if (!mcPath_.empty() && scene::readFile(mcPath_, text)) {
+            std::string err;
+            if (!parseModchart(text, mc_, err)) status_.set("modchart.json: " + err, true);
+        }
+        dirty_ = false;
+        leaveArmed_ = false;
+        selTrack_ = selProp_ = selKey_ = -1;
+    }
+
+    double songLenMs() const {
+        double len = prep_.chart.lengthMs;
+        if (prep_.inst) len = std::max(len, double(prep_.inst->frames()) * 1000.0 / Mixer::kRate);
+        return std::max(1000.0, len);
+    }
+    double chartStepMs() const { return prep_.chart.tempo.empty() ? 500.0 : prep_.chart.stepMs(std::max(0.0, curMs_)); }
+
+    void togglePlay() {
+        App& a = app();
+        if (playing_) { a.mixer.pause(); playing_ = false; return; }
+        a.mixer.setTracks(prep_.inst, prep_.voiceP, prep_.voiceO);
+        a.mixer.setRate(1.0);
+        a.mixer.play(std::max(0.0, curMs_) / 1000.0);
+        playing_ = true;
+    }
+    void seek(double ms) {
+        curMs_ = clampv(ms, 0.0, songLenMs());
+        app().mixer.seek(curMs_ / 1000.0);
+    }
+
+    // ---- selection helpers ----
+
+    void clampSel() {
+        selTrack_ = clampv(selTrack_, -1, int(mc_.tracks.size()) - 1);
+        if (selTrack_ < 0) { selProp_ = selKey_ = -1; return; }
+        const ModTrack& tr = mc_.tracks[size_t(selTrack_)];
+        selProp_ = clampv(selProp_, -1, int(tr.props.size()) - 1);
+        if (selProp_ < 0 || selProp_ >= int(tr.props.size())) { selKey_ = -1; return; }
+        selKey_ = clampv(selKey_, -1, int(tr.props[size_t(selProp_)].keys.size()) - 1);
+    }
+
+    // Timeline geometry shared by draw and hit-testing.
+    float tlX() const { return 320; }
+    float tlW() const { return gfx::W - tlX() - 20; }
+    float tlY() const { return 500; }
+    float rowH() const { return 22; }
+    double xToTime(float x) const { return (x - tlX()) / tlW() * songLenMs(); }
+    float timeToX(double ms) const { return tlX() + float(ms / songLenMs()) * tlW(); }
+
+    struct RowRef { int track, prop; };  // prop -1 = the track's own row (shader span)
+    std::vector<RowRef> rows() const {
+        std::vector<RowRef> out;
+        for (int t = 0; t < int(mc_.tracks.size()); ++t) {
+            const ModTrack& tr = mc_.tracks[size_t(t)];
+            if (tr.target == "shader" || tr.props.empty()) {
+                out.push_back({t, -1});
+            } else {
+                for (int p = 0; p < int(tr.props.size()); ++p) out.push_back({t, p});
+            }
+        }
+        return out;
+    }
+
+    // ---- drawing ----
+
+    void drawHeader() {
+        const float y = 66;
+        if (ui_.button({gfx::W - 330, y - 6, 60, 30}, "<")) cycleSong(-1);
+        if (ui_.button({gfx::W - 264, y - 6, 60, 30}, ">")) cycleSong(1);
+        const std::string label = song_ ? song_->title + "  (" + diff_ + ")" : "no song";
+        gfx::text(FontId::Ui, label, gfx::W - 196, y, 20, kIvory, Align::Right);
+        gfx::text(FontId::Ui, "modchart.json - property tracks for this song", 40, y, 18, kDim);
+        if (ui_.button({gfx::W - 240, y - 6, 110, 30}, "Preview song")) previewSong();
+        if (ui_.button({gfx::W - 120, y - 6, 100, 30}, "Save (F2)")) save();
+    }
+
+    void drawTrackPanel() {
+        const Rectangle box{40, 110, 260, gfx::H - 200};
+        DrawRectangleRounded(box, 0.02f, 6, kPanel);
+        gfx::text(FontId::Ui, "TRACKS", box.x + 12, box.y + 6, 16, kDim);
+        std::vector<std::string> opts;
+        for (const auto& [n, label] : modTargets()) opts.push_back(n);
+        if (ui_.dropdown("addtarget", {box.x + 8, box.y + 26, box.width - 16, 30}, "", opts, addTarget_)) {
+            addTrack(modTargets()[size_t(addTarget_)].first);
+        }
+        float y = box.y + 66;
+        const auto rr = rows();
+        for (const RowRef& r : rr) {
+            const ModTrack& tr = mc_.tracks[size_t(r.track)];
+            const bool isTrackRow = r.prop < 0;
+            const float indent = isTrackRow ? 4.0f : 22.0f;
+            const std::string name = isTrackRow ? tr.target
+                : tr.target + "  " + tr.props[size_t(r.prop)].name;
+            const Rectangle row{box.x + indent, y, box.width - indent - 8, 24};
+            const bool sel = r.track == selTrack_ && (isTrackRow ? selProp_ < 0 : r.prop == selProp_);
+            if (sel || ui_.hover(row)) DrawRectangleRec(row, sel ? Color{90, 66, 140, 255} : Color{50, 38, 76, 255});
+            gfx::text(FontId::Ui, name, row.x + 6, row.y + 3, 16, sel ? kAccent : kInk);
+            if (!isTrackRow) {
+                const ModProp& mp = tr.props[size_t(r.prop)];
+                const double v = evalProp(mp, curMs_);
+                gfx::text(FontId::Ui, TextFormat("%.2f", v), row.x + row.width - 62, row.y + 3, 15, kDim, Align::Right);
+                if (!mp.keys.empty())
+                    gfx::text(FontId::Ui, TextFormat("%d", int(mp.keys.size())), row.x + row.width - 8, row.y + 3, 14, kDim, Align::Right);
+            }
+            if (ui_.hover(row) && ui_.click) {
+                ui_.used = true;
+                selTrack_ = r.track;
+                selProp_ = r.prop;
+                selKey_ = -1;
+            }
+            y += 25;
+            if (y > box.y + box.height - 8) break;
+        }
+        if (ui_.button({box.x + 8, box.y + box.height - 36, box.width - 16, 30}, "Delete track")) delTrack();
+    }
+
+    void drawPreview() {
+        const Rectangle vp{300, 110, 760, 380};
+        DrawRectangleRounded(vp, 0.02f, 6, kPanel);
+        gfx::text(FontId::Ui, "PREVIEW", vp.x + 12, vp.y + 6, 16, kDim);
+        DrawRectangleRec(vp, Color{14, 10, 24, 255});
+        const int lanes = prep_.chart.keys > 0 ? prep_.chart.keys : 4;
+        const double t = app().now;
+        for (int side = 0; side < 2; ++side) {
+            const float base = side == 0 ? vp.x : vp.x + vp.width * 0.5f;
+            const float lw = vp.width * 0.5f / float(lanes);
+            for (int l = 0; l < lanes; ++l) {
+                const float x = base + l * lw;
+                DrawRectangleRec({x + 2, vp.y + vp.height * 0.08f, lw - 4, vp.height * 0.84f}, Color{30, 24, 48, 255});
+                const float ry = side == 0 ? vp.y + vp.height * 0.9f : vp.y + vp.height * 0.1f;
+                DrawRectangleRec({x + lw * 0.22f, ry - 8, lw * 0.56f, 16},
+                                 side == 0 ? Color{120, 200, 255, 220} : Color{255, 120, 160, 220});
+                for (int n = 0; n < 3; ++n) {
+                    const double ph = std::fmod(t * 0.35 + double(l * 7 + n * 13 + side * 31), 3.0);
+                    const float ny = vp.y + vp.height * 0.05f + float(ph / 3.0) * vp.height * 0.8f;
+                    DrawRectangleRec({x + lw * 0.3f, ny, lw * 0.4f, 10},
+                                     side == 0 ? Color{90, 170, 255, 255} : Color{255, 110, 140, 255});
+                }
+            }
+        }
+        const float ty = vp.y + vp.height + 10;
+        if (ui_.button({vp.x, ty, 90, 30}, playing_ ? "Pause" : "Play")) togglePlay();
+        if (ui_.button({vp.x + 100, ty, 70, 30}, "Stop")) {
+            seek(0);
+            if (playing_) { app().mixer.pause(); playing_ = false; }
+        }
+        gfx::text(FontId::Ui, TextFormat("%.2f / %.2f s", curMs_ / 1000.0, songLenMs() / 1000.0), vp.x + 190, ty + 5, 20, kIvory);
+    }
+
+    void drawTimeline() {
+        const Rectangle tl{tlX() - 4, tlY(), tlW() + 4, gfx::H - tlY() - 52};
+        DrawRectangleRounded(tl, 0.02f, 6, Color{20, 16, 30, 255});
+        const auto rr = rows();
+        DrawRectangleRec({tlX(), tlY(), tlW(), 24}, Color{26, 20, 40, 255});
+        for (double s = 0; s <= songLenMs() / 1000.0; s += 10) {
+            const float x = timeToX(s * 1000.0);
+            DrawLineEx({x, tlY() + 24}, {x, tlY() + tl.height}, 1, Color{60, 50, 90, 255});
+            gfx::text(FontId::Ui, TextFormat("%d", int(s)), x + 2, tlY() + 4, 13, kDim);
+        }
+        if (ui_.hover({tlX(), tlY(), tlW(), 24}) && ui_.click) {
+            ui_.used = true;
+            seek(xToTime(ui_.mouse.x));
+        }
+        float y = tlY() + 30;
+        for (const RowRef& r : rr) {
+            const Rectangle lane{tlX(), y, tlW(), rowH() - 3};
+            const bool rowSel = r.track == selTrack_ && r.prop == selProp_;
+            if (rowSel || (ui_.hover(lane) && !ui_.click))
+                DrawRectangleRec(lane, rowSel ? Color{90, 66, 140, 60} : Color{50, 38, 76, 40});
+            DrawLineEx({tlX(), y + rowH() - 3}, {tlX() + tlW(), y + rowH() - 3}, 1, Color{45, 36, 70, 255});
+            const ModTrack& tr = mc_.tracks[size_t(r.track)];
+            std::vector<std::pair<int, int>> keyPos;
+            if (r.prop >= 0) {
+                const ModProp& mp = tr.props[size_t(r.prop)];
+                for (int k = 0; k < int(mp.keys.size()); ++k) {
+                    const float kx = timeToX(mp.keys[size_t(k)].tMs);
+                    keyPos.push_back({k, int(kx)});
+                    const bool ksel = rowSel && k == selKey_;
+                    const Color kc = ksel ? kAccent : Color{140, 220, 255, 255};
+                    DrawRectangleRec({kx - 4, y + 4, 8, rowH() - 11}, kc);
+                    DrawRectangleRec({kx - 2, y + 6, 4, rowH() - 15}, Color{20, 16, 30, 255});
+                }
+            } else if (tr.target == "shader") {
+                const float x0 = timeToX(tr.clip.startMs);
+                const float x1 = tr.clip.endMs > tr.clip.startMs ? timeToX(tr.clip.endMs) : tlX() + tlW();
+                DrawRectangleRec({x0, y + 5, std::max(4.0f, x1 - x0), rowH() - 13}, fade(Color{255, 170, 80, 255}, 0.8f));
+            }
+            if (ui_.hover(lane) && ui_.click) {
+                ui_.used = true;
+                int hit = -1;
+                for (const auto& [ki, kx] : keyPos)
+                    if (std::fabs(ui_.mouse.x - kx) <= 6) { hit = ki; break; }
+                selTrack_ = r.track;
+                selProp_ = r.prop;
+                if (hit >= 0) {
+                    selKey_ = hit;
+                    dragTrack_ = r.track; dragProp_ = r.prop; dragKey_ = hit;
+                } else if (r.prop >= 0) {
+                    addKey(r.track, r.prop, xToTime(ui_.mouse.x));
+                    selProp_ = r.prop;
+                    selKey_ = int(mc_.tracks[size_t(r.track)].props[size_t(r.prop)].keys.size()) - 1;
+                    dirty_ = true;
+                } else {
+                    selKey_ = -1;
+                }
+            }
+            y += rowH();
+            if (y > tl.y + tl.height - 4) break;
+        }
+        DrawLineEx({timeToX(curMs_), tlY()}, {timeToX(curMs_), tl.y + tl.height}, 2, kGold);
+    }
+
+    void drawKeyFields() {
+        const float x = gfx::W - 300, w = 280;
+        float y = tlY() + 8;
+        if (selTrack_ < 0 || selTrack_ >= int(mc_.tracks.size())) return;
+        ModTrack& tr = mc_.tracks[size_t(selTrack_)];
+        DrawRectangleRounded({x - 8, y - 6, w + 16, 120}, 0.02f, 6, kPanel);
+        gfx::text(FontId::Ui, tr.target, x, y, 18, kGold);
+        y += 26;
+        if (tr.target == "shader") {
+            gfx::text(FontId::Ui, "fx: " + tr.clip.fx, x, y, 15, kDim);
+            y += 20;
+            if (ui_.text("shstart", {x, y, w * 0.5f, 28}, "start s", fT_)) { applyClipFields(); dirty_ = true; }
+            if (ui_.text("shend", {x + w * 0.5f, y, w * 0.5f, 28}, "end s", fV_)) { applyClipFields(); dirty_ = true; }
+            return;
+        }
+        if (selProp_ < 0 || selProp_ >= int(tr.props.size())) {
+            gfx::text(FontId::Ui, "Select a property row, then a key.", x, y, 15, kDim);
+            return;
+        }
+        ModProp& mp = tr.props[size_t(selProp_)];
+        gfx::text(FontId::Ui, mp.name, x, y, 18, kIvory);
+        y += 24;
+        if (selKey_ >= 0 && selKey_ < int(mp.keys.size())) {
+            ModKey& k = mp.keys[size_t(selKey_)];
+            char id[32];
+            std::snprintf(id, sizeof id, "k%d", selKey_);
+            if (ui_.text("ktt" + std::string(id), {x, y, w * 0.32f, 28}, "t s", fT_)) { applyKeyFields(); dirty_ = true; }
+            if (ui_.text("kvv" + std::string(id), {x + w * 0.36f, y, w * 0.3f, 28}, "v", fV_)) { applyKeyFields(); dirty_ = true; }
+            static const char* en[5] = {"linear", "easeIn", "easeOut", "easeInOut", "smooth"};
+            if (ui_.dropdown("kev" + std::string(id), {x + w * 0.7f, y, w * 0.3f, 28}, "", {en[0], en[1], en[2], en[3], en[4]}, fEaseIdx_)) {
+                applyKeyFields();
+                dirty_ = true;
+            }
+            gfx::text(FontId::Ui, std::string("value now: ") + TextFormat("%.3f", evalProp(mp, curMs_)), x, y + 32, 15, kDim);
+        } else {
+            gfx::text(FontId::Ui, TextFormat("%d keys - click a lane to add, drag to retime", int(mp.keys.size())), x, y, 15, kDim);
+            gfx::text(FontId::Ui, std::string("value now: ") + TextFormat("%.3f", evalProp(mp, curMs_)), x, y + 20, 15, kDim);
+            if (ui_.button({x, y + 44, w, 28}, "Add key at playhead")) { addKey(selTrack_, selProp_, curMs_); dirty_ = true; }
+        }
+    }
+
+    // ---- editing ops ----
+
+    void addTrack(const std::string& target) {
+        ModTrack tr;
+        tr.target = target;
+        if (target == "shader") {
+            tr.clip.startMs = curMs_;
+            tr.clip.endMs = 0;
+            tr.clip.target = "game";
+            tr.clip.fx = "glitch";
+        } else {
+            for (const auto& [pn, nv] : modProps(target)) {
+                ModProp mp;
+                mp.name = pn;
+                mp.neutral = nv;
+                tr.props.push_back(mp);
+            }
+        }
+        mc_.tracks.push_back(tr);
+        selTrack_ = int(mc_.tracks.size()) - 1;
+        selProp_ = tr.props.empty() ? -1 : 0;
+        selKey_ = -1;
+        dirty_ = true;
+    }
+
+    void delTrack() {
+        if (selTrack_ < 0 || selTrack_ >= int(mc_.tracks.size())) return;
+        mc_.tracks.erase(mc_.tracks.begin() + selTrack_);
+        selTrack_ = selProp_ = selKey_ = -1;
+        dirty_ = true;
+    }
+
+    void addKey(int t, int p, double ms) {
+        if (t < 0 || t >= int(mc_.tracks.size())) return;
+        ModProp& mp = mc_.tracks[size_t(t)].props[size_t(p)];
+        ModKey k;
+        k.tMs = clampv(ms, 0.0, songLenMs());
+        k.value = evalProp(mp, k.tMs);
+        k.ease = "linear";
+        mp.keys.push_back(k);
+        std::stable_sort(mp.keys.begin(), mp.keys.end(),
+                         [](const ModKey& a, const ModKey& b) { return a.tMs < b.tMs; });
+    }
+
+    void delKey() {
+        if (selTrack_ < 0 || selProp_ < 0 || selKey_ < 0) return;
+        ModProp& mp = mc_.tracks[size_t(selTrack_)].props[size_t(selProp_)];
+        if (selKey_ >= int(mp.keys.size())) return;
+        mp.keys.erase(mp.keys.begin() + selKey_);
+        selKey_ = -1;
+        dirty_ = true;
+    }
+
+    void syncKeyFields() {
+        if (selTrack_ < 0 || selProp_ < 0) { fT_.clear(); fV_.clear(); fEaseIdx_ = 0; return; }
+        const ModTrack& tr = mc_.tracks[size_t(selTrack_)];
+        if (tr.target == "shader") {
+            fT_ = TextFormat("%.2f", tr.clip.startMs / 1000.0);
+            fV_ = tr.clip.endMs > tr.clip.startMs ? TextFormat("%.2f", (tr.clip.endMs - tr.clip.startMs) / 1000.0) : "0";
+            return;
+        }
+        const ModProp& mp = tr.props[size_t(selProp_)];
+        if (selKey_ < 0 || selKey_ >= int(mp.keys.size())) { fT_.clear(); fV_.clear(); return; }
+        const ModKey& k = mp.keys[size_t(selKey_)];
+        fT_ = TextFormat("%.3f", k.tMs / 1000.0);
+        fV_ = TextFormat("%g", k.value);
+        fEaseIdx_ = 0;
+        for (int i = 0; i < 5; ++i)
+            if (k.ease == kEaseNames[i]) { fEaseIdx_ = i; break; }
+    }
+
+    void applyKeyFields() {
+        if (selTrack_ < 0 || selProp_ < 0 || selKey_ < 0) return;
+        ModKey& k = mc_.tracks[size_t(selTrack_)].props[size_t(selProp_)].keys[size_t(selKey_)];
+        k.tMs = clampv(std::atof(fT_.c_str()) * 1000.0, 0.0, songLenMs());
+        k.value = std::atof(fV_.c_str());
+        k.ease = kEaseNames[clampv(fEaseIdx_, 0, 4)];
+        ModProp& mp = mc_.tracks[size_t(selTrack_)].props[size_t(selProp_)];
+        std::stable_sort(mp.keys.begin(), mp.keys.end(),
+                         [](const ModKey& a, const ModKey& b) { return a.tMs < b.tMs; });
+    }
+
+    void applyClipFields() {
+        if (selTrack_ < 0) return;
+        ModTrack& tr = mc_.tracks[size_t(selTrack_)];
+        if (tr.target != "shader") return;
+        tr.clip.startMs = std::max(0.0, std::atof(fT_.c_str()) * 1000.0);
+        const double e = std::atof(fV_.c_str());
+        tr.clip.endMs = e > 0 ? tr.clip.startMs + e * 1000.0 : 0;
+    }
+
+    void previewSong() {
+        if (!song_ || !audioReady_) return;
+        App& a = app();
+        PlayRequest req;
+        req.songId = song_->id;
+        req.diff = diff_;
+        req.visualsOnly = true;
+        a.change(makePlay(req));
+    }
+
+    void exitEditor() {
+        App& a = app();
+        if (a.visualsReturn) {
+            const PlayRequest req = *a.visualsReturn;
+            a.visualsReturn.reset();
+            a.change(makePlay(req));
+            return;
+        }
+        a.change(makeEditorMenu());
+    }
+
+    void save() {
+        if (mcPath_.empty()) { status_.set("This song has no folder for modchart.json", true); return; }
+        std::string err;
+        if (!saveText(mcPath_, modchartJson(mc_), err)) { status_.set(err, true); return; }
+        dirty_ = false;
+        leaveArmed_ = false;
+        status_.set("Saved " + mcPath_);
+    }
+};
+
+const char* ModchartEditorState::kEaseNames[5] = {"linear", "easeIn", "easeOut", "easeInOut", "smooth"};
+
+std::unique_ptr<State> makeVisualsEditorFor(const std::string& songId, const std::string& diff) {
+    auto s = std::make_unique<VisualsEditorState>();
+    s->openFor(songId, diff);
+    return s;
+}
+std::unique_ptr<State> makeModchartEditor() { return std::make_unique<ModchartEditorState>(); }
+std::unique_ptr<State> makeModchartEditorFor(const std::string& songId, const std::string& diff) {
+    auto s = std::make_unique<ModchartEditorState>();
+    s->openFor(songId, diff);
+    return s;
+}
 
 }  // namespace gh

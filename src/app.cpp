@@ -291,6 +291,7 @@ int App::run(int argc, char** argv) {
     InitWindow(platform::kAndroid ? 0 : std::max(320, winW_), platform::kAndroid ? 0 : std::max(180, winH_),
                "RAID Engine");
     platform::afterWindowInit();
+    platform::setWindowIcon();
     platform::setVsync(settings.vsync);  // explicit both ways: some drivers default to on
     SetExitKey(KEY_NULL);
     if (!platform::kAndroid) {
@@ -300,7 +301,7 @@ int App::run(int argc, char** argv) {
 
     InitAudioDevice();
     mixer.init();
-    sfxInit();
+    sfxInit(base);
     applyVolumes();
     gfx::init(base);
     library.scan(base, [](const std::string& zip, double f) {
@@ -340,7 +341,7 @@ int App::run(int argc, char** argv) {
     else if (autoRun.state == "character-editor") state_ = makeCharacterEditor();
     else if (autoRun.state == "stage-editor") state_ = makeStageEditor();
     else if (autoRun.state == "event-editor") state_ = makeEventEditor();
-    else state_ = makeTitle();
+    else state_ = makeStartup();
     state_->enter();
     logScreen(*state_);
 

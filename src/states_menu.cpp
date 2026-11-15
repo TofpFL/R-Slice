@@ -1,6 +1,7 @@
 // Title, main menu, story, freeplay and credits screens.
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
 #include <thread>
 
@@ -10,6 +11,10 @@
 #include "gfx.hpp"
 #include "platform.hpp"
 #include "raylib.h"
+#include "scene.hpp"
+#include "title_atlas.hpp"
+#include "video.hpp"
+#include "vslice_ui.hpp"
 
 #ifndef GH_VERSION
 #define GH_VERSION "dev"  // set by CMake from project(VERSION)
@@ -131,7 +136,153 @@ void waitForBackgroundJobs() {
     for (int i = 0; i < 600 && g_jobs.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
+// -------------------------------------------------------------- Startup --
+
+// Boot cutscene: plays assets/videos/startup.* through VideoPlayer (an .mp4
+// is converted to MPEG-1 once by ffmpeg into cache/videos/). ENTER skips;
+// on skip or end the screen fades to black and hands off to the title.
+
+class StartupState : public State {
+public:
+    StartupState() { files_.setRoots({app().base + "assets"}); }
+
+    void enter() override {
+        retryAt_ = 0;
+        resolve();
+    }
+
+    bool wantsMenuMusic() const override { return false; }  // the video carries its own audio
+
+    TouchLayout touchLayout() const override {
+        TouchLayout t;
+        t.pad = false;
+        t.tapCode = KEY_ENTER;
+        return t;
+    }
+
+    void update(double dt) override {
+        App& a = app();
+        if (leaving_) {
+            fade_ = std::min(1.0f, fade_ + float(dt) / 0.6f);
+            if (fade_ >= 1.0f) a.change(makeTitle());
+            return;
+        }
+        if (!player_) {
+            if (failed_) { leaving_ = true; return; }
+            if (a.now >= retryAt_) resolve();
+            return;
+        }
+        player_->update(dt);
+        if (player_->ended() || a.input.accept()) {
+            leaving_ = true;
+            fade_ = 0.0f;
+        }
+    }
+
+    void draw() override {
+        gfx::beginCanvas();
+        DrawRectangleRec({0, 0, gfx::W, gfx::H}, BLACK);
+        if (player_ && player_->texture().id) {
+            const Texture2D& t = player_->texture();
+            const float sc = std::min(gfx::W / float(t.width), gfx::H / float(t.height));
+            const float w = t.width * sc, h = t.height * sc;
+            DrawTexturePro(t, {0, 0, float(t.width), float(t.height)},
+                           {(gfx::W - w) * 0.5f, (gfx::H - h) * 0.5f, w, h}, {0, 0}, 0, WHITE);
+            if (!leaving_)
+                gfx::text(FontId::Ui, "PRESS ENTER TO SKIP", gfx::W - 30, gfx::H - 40, 20,
+                          fade(WHITE, 0.45f), Align::Right);
+        } else if (!failed_) {
+            gfx::text(FontId::Ui, "Loading intro...", gfx::W / 2, gfx::H / 2 - 15, 30,
+                      fade(WHITE, 0.8f), Align::Center);
+        }
+        if (fade_ > 0) DrawRectangleRec({0, 0, gfx::W, gfx::H}, fade(BLACK, fade_));
+        gfx::endCanvas();
+    }
+
+private:
+    void resolve() {
+        App& a = app();
+        retryAt_ = a.now + 0.5;  // poll while ffmpeg converts in the background
+        const VideoSource src = findVideo(files_, "startup", a.base);
+        if (src.converting) return;
+        if (!src.error.empty()) { failed_ = true; return; }  // no video/ffmpeg: straight to title
+        player_ = std::make_unique<VideoPlayer>();
+        if (!player_->open(src.playable, false, true)) {
+            player_.reset();
+            failed_ = true;
+            return;
+        }
+        player_->setVolume(a.settings.musicVol);
+    }
+
+    scene::Files files_;
+    std::unique_ptr<VideoPlayer> player_;
+    double retryAt_ = 0;
+    bool leaving_ = false, failed_ = false;
+    float fade_ = 0;
+};
+
 // ------------------------------------------------------------------ Title --
+
+// V-Slice title screen (mikolka/vslice/ui/title/TitleState.hx): solid dark
+// backdrop, the GF dance sprite beat-synced on the speaker stack at
+// bottom-right, the game logo top-left with a drop shadow, and the
+// "PRESS ENTER" strip flashing cyan/blue. Enter plays the pressed frames,
+// flashes white, then hands off to the main menu.
+
+struct TitleAssets {
+    TitleAtlas gf, enter, stage, speakers;
+};
+
+// "RAID Engine Bop" frame sequence (assets/title/bop/f001.png..fNNN.png),
+// extracted from the .mov at 960x540/30fps. Loaded once on first use.
+const std::vector<Texture2D>& bopFrames() {
+    static std::vector<Texture2D> frames = [] {
+        std::vector<Texture2D> v;
+        const std::string dir = app().base + "assets/title/bop/";
+        for (int i = 1;; ++i) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "f%03d.png", i);
+            const std::string path = dir + name;
+            if (!FileExists(path.c_str())) break;
+            Texture2D t = LoadTexture(path.c_str());
+            if (t.id) {
+                SetTextureFilter(t, TEXTURE_FILTER_TRILINEAR);
+                v.push_back(t);
+            }
+            if (i > 600) break;
+        }
+        return v;
+    }();
+    return frames;
+}
+
+const TitleAssets& titleAssets() {
+    static TitleAssets a = [] {
+        TitleAssets t;
+        const std::string dir = app().base + "assets/title/";
+        std::string err;
+        loadAtlasXml(dir + "gfDanceTitle.png", dir + "gfDanceTitle.xml", t.gf, &err);
+        loadAtlasXml(dir + "titleEnter.png", dir + "titleEnter.xml", t.enter, &err);
+        loadAtlasJson(dir + "stage_full.png", dir + "stage_full.json", t.stage, &err);
+        loadAtlasJson(dir + "speakers.png", dir + "speakers.json", t.speakers, &err);
+        return t;
+    }();
+    return a;
+}
+
+// Bottom-center anchored blit: `h` is the drawn pixel height, `cy` the
+// horizontal center, `bottom` the ground line the sprite stands on.
+void drawAtlasFrame(const TitleAtlas& at, const char* name, float cx, float bottom, float h,
+                    Color tint) {
+    const AtlasFrame* f = at.find(name);
+    if (!f || f->src.width <= 0 || f->src.height <= 0) return;
+    const float s = h / f->src.height;
+    DrawTexturePro(at.tex, f->src,
+                   {cx - f->src.width * s * 0.5f, bottom - f->src.height * s, f->src.width * s,
+                    f->src.height * s},
+                   {0, 0}, 0, tint);
+}
 
 class TitleState : public State {
 public:
@@ -141,9 +292,22 @@ public:
         t.tapCode = KEY_ENTER;
         return t;
     }
+
+    void enter() override { logoT0_ = app().now; }
+
     void update(double) override {
         App& a = app();
         flash_ = std::max(0.0f, flash_ - float(a.dt) * 1.8f);
+        if (a.input.pressed(KEY_F3)) debug_ = !debug_;
+        // Beat-synced dance: each beat flips GF's direction and restarts the
+        // frame cycle, like TitleState.hx's beatHit().
+        const long beat = (long)std::floor(a.menuBeat());
+        if (beat != beatSeen_) {
+            beatSeen_ = beat;
+            danceRight_ = !danceRight_;
+            animT_ = a.now;
+        }
+        fps_ = fps_ <= 0 ? 1.0 / std::max(a.dt, 1e-4) : fps_ * 0.92 + (1.0 / std::max(a.dt, 1e-4)) * 0.08;
         if (!leaving_ && (a.input.accept() || a.input.firstPressed() != 0) && !a.input.pressed(KEY_F11)) {
             leaving_ = true;
             leaveAt_ = a.now;
@@ -152,42 +316,109 @@ public:
         }
         if (leaving_ && a.now - leaveAt_ > 0.75) a.change(makeMainMenu());
     }
+
     void draw() override {
         App& a = app();
         const double now = a.now;
-        const float pulse = menuPulse();
         gfx::beginCanvas();
-        drawMenuBackground(now, 0xF4C76B, pulse);
-        gfx::glow({gfx::W / 2, 250}, 380 + 30 * pulse, fade(kGold, 0.22f));
-        const Texture2D logo = menuLogo();
-        if (logo.id) {
-            const float w = 735.0f;
-            const float h = w * float(logo.height) / float(logo.width);
-            DrawTexturePro(logo, {0, 0, float(logo.width), float(logo.height)},
-                           {gfx::W / 2 - w / 2, 60, w, h}, {0, 0}, 0, WHITE);
-        } else {
-            const float s = 1.0f + 0.025f * pulse;
-            gfx::glowText(FontId::Title, "RAID ENGINE", gfx::W / 2, 190 - 6 * s, 96 * s, kGold,
-                          Color{255, 190, 80, 255});
-            gfx::text(FontId::Title, "the .RAID chart engine", gfx::W / 2, 316, 38, kIvory, Align::Center, 2.0f);
+        DrawRectangle(0, 0, gfx::W, gfx::H, Color{9, 9, 13, 255});
+
+        const TitleAssets& ta = titleAssets();
+
+        // Speaker stack, bottom-right, flush with the window's bottom edge.
+        if (ta.speakers.tex.id) drawAtlasFrame(ta.speakers, "0000", 1140, 712, 430, WHITE);
+
+        // GF dance: two 15-frame cycles swapped every beat at 24 fps. She is
+        // drawn large in front of the speakers, feet near the bottom edge.
+        if (ta.gf.tex.id) {
+            static const int kLeft[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+            static const int kRight[] = {15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29};
+            const int* list = danceRight_ ? kRight : kLeft;
+            const int fi = int((now - animT_) * 24.0) % 15;
+            char name[32];
+            std::snprintf(name, sizeof(name), "gfDance%04d", list[fi]);
+            // Dark cyan halo + light blue core glow behind GF.
+            gfx::glow({950, 430}, 300, fade(Color{20, 90, 110, 255}, 0.55f));
+            gfx::glow({950, 430}, 190, fade(Color{90, 200, 235, 255}, 0.35f));
+            gfx::glow({990, 330}, 120, fade(Color{140, 230, 255, 255}, 0.30f));
+            drawAtlasFrame(ta.gf, name, 950, 705, 560, WHITE);
         }
-        const float blink = leaving_ ? (std::fmod(float(now) * 12.0f, 2.0f) < 1.0f ? 1.0f : 0.2f)
-                                     : 0.55f + 0.45f * std::sin(float(now) * 3.5f);
-        gfx::text(FontId::Ui, a.touchMode ? "TAP TO BEGIN" : "PRESS ENTER TO BEGIN", gfx::W / 2, 596, 40,
-                  fade(WHITE, blink), Align::Center, 2.0f);
-        gfx::text(FontId::Ui, "A rhythm duel  -  v" GH_VERSION, gfx::W / 2, 690, 22, fade(kIvory, 0.7f), Align::Center,
-                  1.0f);
+
+        // RAID logo, top-left, with a soft drop shadow and a cyan glow so it
+        // stands out on the black backdrop. It bops once per menu-music beat
+        // (menuPulse peaks at 1.0 on the beat and decays) - tempo-locked, so
+        // it looks identical at any frame rate.
+        const std::vector<Texture2D>& bop = bopFrames();
+        const Texture2D logo = menuLogo();
+        const float logoPulse = menuPulse();
+        if (!bop.empty()) {
+            // The .mov bop: 30 fps frame sequence, looped, with the same cyan
+            // glow treatment the static logo got.
+            const int fi = int((now - logoT0_) * 30.0) % int(bop.size());
+            const Texture2D& f = bop[size_t(fi)];
+            const float w = 570.0f, h = w * float(f.height) / float(f.width);
+            gfx::glow({100, 80}, 320 + 40 * logoPulse, fade(Color{24, 110, 140, 255}, 0.55f + 0.2f * logoPulse));
+            gfx::glow({100, 80}, 200, fade(Color{110, 215, 245, 255}, 0.30f));
+            DrawTexturePro(f, {0, 0, float(f.width), float(f.height)}, {62, 62, w, h}, {0, 0}, 0, WHITE);
+        } else if (logo.id) {
+            const float w = 460.0f * (1.0f + 0.035f * logoPulse);
+            const float h = w * float(logo.height) / float(logo.width);
+            const float lx = 92.0f - 8.0f * logoPulse, ly = 58.0f - 7.0f * logoPulse;
+            const Rectangle src{0, 0, float(logo.width), float(logo.height)};
+            gfx::glow({110, 70}, 320 + 40 * logoPulse, fade(Color{24, 110, 140, 255}, 0.55f + 0.2f * logoPulse));
+            gfx::glow({110, 70}, 200, fade(Color{110, 215, 245, 255}, 0.30f));
+            DrawTexturePro(logo, src, {lx + 7, ly + 7, w, h}, {0, 0}, 0, Color{0, 0, 0, 150});
+            DrawTexturePro(logo, src, {lx, ly, w, h}, {0, 0}, 0, WHITE);
+        } else {
+            gfx::glowText(FontId::Title, "RAID ENGINE", 280, 120, 84, Color{140, 230, 255, 255},
+                          Color{40, 140, 190, 255});
+        }
+
+        // "PRESS ENTER TO BEGIN" - ENTER IDLE flashes cyan/blue like the
+        // vanilla titleTextColors swap; ENTER PRESSED shows while leaving.
+        if (ta.enter.tex.id) {
+            if (leaving_) {
+                const char* pn = (std::fmod(float(now) * 11.0f, 2.0f) < 1.0f) ? "ENTER PRESSED0000"
+                                                                           : "ENTER PRESSED0001";
+                drawAtlasFrame(ta.enter, pn, gfx::W / 2, 648, 40, WHITE);
+            } else {
+                // Smooth cyan<->blue fade with a breathing alpha and a soft
+                // glow pass instead of the old hard color blink.
+                const float t = 0.5f + 0.5f * std::sin(float(now) * 2.4f);
+                Color tc{uint8_t(90 + (140 - 90) * t), uint8_t(90 + (240 - 90) * t),
+                         uint8_t(235 + (255 - 235) * t), 255};
+                tc.a = uint8_t(150 + 105 * t);
+                drawAtlasFrame(ta.enter, "ENTER IDLE0000", gfx::W / 2, 648, 46,
+                               Color{24, 120, 160, 70});
+                drawAtlasFrame(ta.enter, "ENTER IDLE0000", gfx::W / 2, 648, 40, tc);
+            }
+        } else {
+            const float blink = leaving_ ? (std::fmod(float(now) * 12.0f, 2.0f) < 1.0f ? 1.0f : 0.2f)
+                                         : 0.55f + 0.45f * std::sin(float(now) * 3.5f);
+            gfx::text(FontId::Ui, a.touchMode ? "TAP TO BEGIN" : "PRESS ENTER TO BEGIN",
+                      gfx::W / 2, 596, 40, fade(WHITE, blink), Align::Center, 2.0f);
+        }
+
+        gfx::text(FontId::Ui, "RAID Engine V0.5", 24, gfx::H - 58, 20, fade(Color{120, 220, 250, 255}, 0.85f), Align::Left, 1.0f);
+        gfx::text(FontId::Ui, "R-Slice V0.1", 24, gfx::H - 32, 20, fade(kIvory, 0.7f), Align::Left, 1.0f);
         if (!a.mixer.audioOk())
             gfx::text(FontId::Ui, "No audio device found - the game will run silently", gfx::W / 2, 520, 22,
                       Color{255, 160, 140, 255}, Align::Center, 1.5f);
+
+        if (debug_) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "FPS: %.0f | %.0f MB", fps_, platform::processMemoryMB());
+            gfx::text(FontId::Ui, buf, 10, 8, 14, Color{255, 255, 255, 110}, Align::Left, 1.0f);
+        }
         if (flash_ > 0) DrawRectangleRec({0, 0, gfx::W, gfx::H}, fade(WHITE, flash_ * 0.8f));
         gfx::endCanvas();
     }
 
 private:
-    bool leaving_ = false;
-    double leaveAt_ = 0;
-    float flash_ = 0;
+    bool leaving_ = false, debug_ = false, danceRight_ = true;
+    double leaveAt_ = 0, animT_ = 0, logoT0_ = 0;
+    long beatSeen_ = -1;
+    float flash_ = 0, fps_ = 0;
 };
 
 // -------------------------------------------------------------- Main menu --
@@ -246,16 +477,20 @@ public:
             Color c = on ? kGold : fade(kIvory, 0.55f);
             if (chosen_ >= 0 && on && std::fmod(float(now - chosenAt_) * 10.0f, 2.0f) < 1.0f) c = WHITE;
             if (chosen_ >= 0 && !on) c = fade(c, std::max(0.0f, 1.0f - float(now - chosenAt_) * 3.0f));
-            if (on) gfx::glowText(FontId::Title, items[i], gfx::W / 2, y, size, c, Color{255, 180, 80, 255});
+            if (on) gfx::glowText(FontId::Title, items[i], gfx::W / 2, y, size, c, Color{255, 170, 60, 255});
             else gfx::text(FontId::Title, items[i], gfx::W / 2, y + 6, size, c, Align::Center, 2.0f);
             if (on) {
-                const float w = gfx::measure(FontId::Title, items[i], size).x * 0.5f + 40 + 6 * pulse;
-                gfx::drawNote(gfx::kRight, {gfx::W / 2 - w, y + size * 0.55f}, 44);
-                gfx::drawNote(gfx::kLeft, {gfx::W / 2 + w, y + size * 0.55f}, 44);
+                // V-Slice selection marker: an orange bar each side
+                const float w = gfx::measure(FontId::Title, items[i], size).x * 0.5f + 44 + 6 * pulse;
+                DrawRectangleRec({gfx::W / 2 - w - 26, y + size * 0.42f, 14, 14}, vs::kAccent);
+                DrawRectangleRec({gfx::W / 2 + w + 12, y + size * 0.42f, 14, 14}, vs::kAccent);
             }
         }
+        // H-Slice version stack, bottom left
+        gfx::text(FontId::Ui, "RAID Engine v" GH_VERSION, 16, gfx::H - 78, 16, fade(kIvory, 0.7f));
+        gfx::text(FontId::Ui, "P-Slice inspired UI  -  raylib", 16, gfx::H - 58, 16, fade(kIvory, 0.7f));
+        gfx::text(FontId::Ui, a.library.report(), 16, gfx::H - 38, 16, fade(kIvory, 0.6f));
         hints("UP/DOWN select   ENTER confirm   7 editors   ESC back   F11 fullscreen");
-        gfx::text(FontId::Ui, a.library.report(), 16, gfx::H - 70, 20, fade(kIvory, 0.6f));
         gfx::endCanvas();
     }
 
@@ -379,7 +614,7 @@ public:
             if (in.back() || in.pressed(KEY_TAB)) modsOpen_ = false;
             return;
         }
-        if (n > 0) {
+        if (n > 0 && !previewPlaying_) {  // H-Slice: selection is locked while a preview plays
             if (in.up()) { sel = (sel + n - 1) % n; changed(); }
             if (in.down()) { sel = (sel + 1) % n; changed(); }
             const int nd = int(list_[size_t(sel)]->diffs.size());
@@ -387,6 +622,28 @@ public:
                 if (in.left()) { a.freeplayDiff = (diffIndex() + nd - 1) % nd; sfxPlay(Sfx::Scroll); }
                 if (in.right()) { a.freeplayDiff = (diffIndex() + 1) % nd; sfxPlay(Sfx::Scroll); }
             }
+        }
+        // MusicPlayer transport: SPACE toggles the preview, LEFT/RIGHT seek.
+        if (n > 0 && in.pressed(KEY_SPACE)) {
+            if (previewPlaying_) {
+                if (previewPaused_) { a.mixer.resume(); previewPaused_ = false; }
+                else { a.mixer.pause(); previewPaused_ = true; }
+            } else if (!job_.running() && a.now - selChangedAt_ > 0.2) {
+                const SongEntry* e = list_[size_t(sel)];
+                pendingId_ = e->id;
+                const SongEntry copy = *e;
+                job_.start([copy] { return app().library.preview(copy); });
+            }
+        }
+        if (previewPlaying_ && !previewPaused_) {
+            previewCur_ = a.mixer.time(a.now) * 1000.0;
+            const bool l = in.isDown(KEY_LEFT), r = in.isDown(KEY_RIGHT);
+            if (in.left()) seekPreview(-1000);
+            if (in.right()) seekPreview(1000);
+            if (l || r) {
+                scrubHold_ += dt;
+                if (scrubHold_ > 0.5) seekPreview((r ? 1.0 : -1.0) * 40000.0 * dt);
+            } else scrubHold_ = 0;
         }
         if (in.pressed(KEY_TAB)) { modsOpen_ = true; sfxPlay(Sfx::Scroll); }
         // Android: mod zips picked in the system file browser are copied to mods/.
@@ -419,7 +676,10 @@ public:
                 if (list_[size_t(i)]->id == id) sel = i;
             sfxPlay(Sfx::Confirm);
         }
-        if (in.back()) { sfxPlay(Sfx::Cancel); a.change(makeMainMenu()); return; }
+        if (in.back()) {
+            if (previewPlaying_) { stopPreview(); return; }
+            sfxPlay(Sfx::Cancel); a.change(makeMainMenu()); return;
+        }
         if (in.pressed(KEY_M)) { sfxPlay(Sfx::Confirm); a.change(makeModPacks()); return; }
         if ((in.pressed(KEY_SEVEN) || in.pressed(KEY_KP_7)) && n > 0) {  // chart editor, as in Psych
             const SongEntry* e = list_[size_t(sel)];
@@ -429,10 +689,11 @@ public:
                 return;
             }
         }
-        if (in.accept() && n > 0) {
+        if (in.accept() && n > 0 && !previewPlaying_) {
             const SongEntry* e = list_[size_t(sel)];
             if (!e->diffs.empty()) {
                 sfxPlay(Sfx::Confirm);
+                previewPlaying_ = previewPaused_ = false;
                 PlayRequest r;
                 r.songId = e->id;
                 r.diff = e->diffs[size_t(diffIndex())];
@@ -440,28 +701,24 @@ public:
                 return;
             }
         }
-        // song preview
-        if (n > 0) {
-            const SongEntry* e = list_[size_t(sel)];
-            if (!job_.running() && previewId_ != e->id && a.now - selChangedAt_ > 0.45) {
-                pendingId_ = e->id;
-                const SongEntry copy = *e;
-                job_.start([copy] { return app().library.preview(copy); });
+        // song preview job (started by SPACE)
+        if (job_.ready()) {
+            PcmPtr pcm = job_.take();
+            const SongEntry* e = n > 0 ? list_[size_t(sel)] : nullptr;
+            if (pcm && e && pendingId_ == e->id && !previewPlaying_) {
+                a.stopMenuMusic();
+                a.mixer.setTracks(pcm, nullptr, nullptr);
+                const double len = double(pcm->frames()) / Mixer::kRate;
+                const double start = e->builtin ? len * 0.38 : len * 0.3;
+                a.mixer.setLoop(true, start, std::min(len, start + 20.0));
+                a.mixer.setRate(1.0);
+                a.mixer.play(start);
+                previewPlaying_ = true;
+                previewPaused_ = false;
+                previewLen_ = len * 1000.0;
+                previewCur_ = start * 1000.0;
             }
-            if (job_.ready()) {
-                PcmPtr pcm = job_.take();
-                if (pcm && pendingId_ == e->id) {
-                    a.stopMenuMusic();
-                    a.mixer.setTracks(pcm, nullptr, nullptr);
-                    const double len = double(pcm->frames()) / Mixer::kRate;
-                    const double start = e->builtin ? len * 0.38 : len * 0.3;
-                    a.mixer.setLoop(true, start, len);
-                    a.mixer.setRate(1.0);
-                    a.mixer.play(start);
-                    previewPlaying_ = true;
-                }
-                previewId_ = pendingId_;
-            }
+            previewId_ = pendingId_;
         }
     }
 
@@ -472,68 +729,78 @@ public:
         const unsigned hex = (unsigned(bg_.r) << 16) | (unsigned(bg_.g) << 8) | bg_.b;
         drawMenuBackground(now, hex, previewPlaying_ ? 0.0f : menuPulse());
         const int n = int(list_.size());
-        for (int i = std::max(0, int(anim_) - 7); i < std::min(n, int(anim_) + 8); ++i) {
+        // ---- song carousel: H-Slice's Alphabet titles + HealthIcons --------
+        // item.x = 90 + (i - lerp) * 20 ; item.y = 320 + (i - lerp) * 156
+        const float drawDist = 4.0f;
+        for (int i = std::max(0, int(anim_) - 5); i < std::min(n, int(anim_) + 6); ++i) {
             const float d = float(i) - anim_;
-            const float y = 330 + d * 76;
-            const float x = 150 + d * 22;
+            if (std::fabs(d) > drawDist + 0.6f) continue;
+            const float y = 320.0f + d * 156.0f;
+            const float x = 110.0f + d * 20.0f;
             const bool on = i == a.freeplaySel;
-            const float alpha = std::max(0.0f, 1.0f - std::fabs(d) * 0.2f);
             const SongEntry* e = list_[size_t(i)];
-            const CharId cid = e->builtin ? charFromName(e->opponent) : CharId::Shade;
-            drawIcon(cid, gfx::rgb(e->color), {x - 50, y + 26}, on ? 70.0f : 56.0f, false, now);
-            gfx::text(FontId::Ui, e->title, x, y, on ? 52.0f : 42.0f, fade(on ? WHITE : kIvory, alpha), Align::Left, 2.0f);
+            const float ts = 58.0f;
+            const Color tc = on ? WHITE : fade(kIvory, 0.6f);
+            gfx::text(FontId::Title, e->title, x, y, ts, fade(tc, on ? 1.0f : std::max(0.25f, 0.6f - std::fabs(d) * 0.12f)), Align::Left, 2.0f);
+            const float tw = gfx::measure(FontId::Title, e->title, ts).x;
             if (on && !e->builtin)
-                gfx::text(FontId::Ui, e->subtitle, x + 4, y + 50, 20, fade(kGold, 0.8f), Align::Left, 1.0f);
+                gfx::text(FontId::Ui, e->subtitle, x + 4, y + 46, 20, fade(kGold, 0.8f), Align::Left, 1.0f);
+            // HealthIcon: character icon just right of the title
+            const CharId cid = e->builtin ? charFromName(e->opponent) : CharId::Shade;
+            drawIcon(cid, gfx::rgb(e->color), {x + tw + 14, y - 18}, on ? 72.0f : 56.0f, false, now);
         }
-        // info panel
-        DrawRectangleRounded({830, 70, 410, 560}, 0.06f, 12, Color{8, 6, 16, 190});
+        // ---- top-right: scoreText/diffText or the MusicPlayer bar -----------
+        const float px = gfx::W * 0.7f;  // 896
         if (n > 0) {
             const SongEntry* e = list_[size_t(a.freeplaySel)];
-            const CharId cid = e->builtin ? charFromName(e->opponent) : CharId::Shade;
-            drawIcon(cid, gfx::rgb(e->color), {1035, 175}, 150, false, now);
-            gfx::text(FontId::Title, e->title, 1035, 262, e->title.size() > 16 ? 26.0f : 34.0f, kGold, Align::Center, 2.0f);
-            float y = 312;
-            for (const std::string& l : wrap(e->builtin ? e->subtitle : ("From: " + e->subtitle), 36)) {
-                gfx::text(FontId::Ui, l, 1035, y, 22, kIvory, Align::Center);
-                y += 24;
+            const std::string d = e->diffs.empty() ? "" : e->diffs[size_t(diffIndex())];
+            if (!previewPlaying_) {
+                // scoreBG: black bar behind the right-aligned personal best
+                DrawRectangleRec({px - 6, 0, gfx::W - px + 6, 72}, Color{0, 0, 0, 153});
+                const ScoreEntry* best = d.empty() ? nullptr : a.scores.get(Scores::key(e->id, d));
+                const std::string bs = best ? (fmtThousands(best->score) + " (" + TextFormat("%.2f%%", best->acc * 100.0) + ")")
+                                            : "-";
+                gfx::text(FontId::Ui, "PERSONAL BEST: " + bs, gfx::W - 6, 5, 30, WHITE, Align::Right, 1.5f);
+                if (!d.empty()) {
+                    std::string du = d;
+                    for (char& c : du) c = char(std::toupper((unsigned char)c));
+                    gfx::text(FontId::Ui, e->diffs.size() > 1 ? "< " + du + " >" : du, px + 140, 42, 24,
+                              diffColor(d), Align::Center, 1.5f);
+                }
+            } else {
+                // playbackBG + songTxt/timeTxt/progressBar (MusicPlayer)
+                DrawRectangleRec({px - 6, 0, gfx::W - px + 6, 105}, Color{0, 0, 0, 153});
+                gfx::text(FontId::Ui, std::string("PLAYING: ") + e->title + (previewPaused_ ? " (PAUSED)" : ""),
+                          gfx::W - 6, 5, 30, WHITE, Align::Right, 1.5f);
+                const double len = previewLen_;
+                const double cur = previewCur_;
+                auto fmtT = [](double ms) {
+                    const int s = int(ms / 1000);
+                    return TextFormat("%d:%02d", s / 60, s % 60);
+                };
+                gfx::text(FontId::Ui, std::string(fmtT(cur)) + " / " + fmtT(len), gfx::W - 6, 44, 30, WHITE, Align::Right, 1.5f);
+                const float bx = px - 6, bw = gfx::W - px;
+                DrawRectangleRec({bx, 82, bw, 10}, Color{0, 0, 0, 255});
+                if (len > 0) DrawRectangleRec({bx, 82, bw * float(clampv(cur / len, 0.0, 1.0)), 10}, WHITE);
+                gfx::text(FontId::Ui, "<", px + 40, 30, 30, WHITE, Align::Center, 1.5f);
+                gfx::text(FontId::Ui, ">", px + 200, 30, 30, WHITE, Align::Center, 1.5f);
             }
-            if (!e->diffs.empty()) {
-                const std::string d = e->diffs[size_t(diffIndex())];
-                const Color dc = diffColor(d);
-                const float bob = std::sin(float(now) * 4.0f) * 3.0f;
-                gfx::drawNote(gfx::kLeft, {880 - bob, 430}, 40);
-                gfx::drawNote(gfx::kRight, {1190 + bob, 430}, 40);
-                gfx::text(FontId::Title, toLower(d) == "infernal" ? "INFERNAL" : d, 1035, 410, 34, dc, Align::Center, 2.0f);
-                const ScoreEntry* best = a.scores.get(Scores::key(e->id, d));
-                const std::string bs = best ? fmtThousands(best->score) + "  -  " + TextFormat("%.2f%%", best->acc * 100.0) +
-                                                  "  -  " + best->rank
-                                            : "No record yet";
-                gfx::text(FontId::Ui, "BEST", 1035, 466, 20, fade(kGold, 0.8f), Align::Center);
-                gfx::text(FontId::Ui, bs, 1035, 488, 26, WHITE, Align::Center, 1.5f);
-                gfx::text(FontId::Ui, TextFormat("Difficulty %d / %d", diffIndex() + 1, int(e->diffs.size())), 1035, 524, 20,
-                          fade(kIvory, 0.6f), Align::Center);
-            }
-            const Modifiers& m = a.mods;
-            std::string ms = TextFormat("Rate %.2fx", m.rate);
-            if (m.botplay) ms += "  Botplay";
-            if (m.practice) ms += "  Practice";
-            if (m.mirror) ms += "  Opponent";
-            if (m.scrollType == 1) ms += TextFormat("  Scroll x%.2f", m.scrollValue);
-            if (m.scrollType == 2) ms += TextFormat("  Scroll %.1f", m.scrollValue);
-            if (m.patternLog) ms += "  PatLog";
-            gfx::text(FontId::Ui, ms, 1035, 586, 22,
-                      (m.rate != 1.0 || m.botplay || m.practice || m.mirror || m.scrollType != 0 || m.patternLog) ? kGold : fade(kIvory, 0.5f), Align::Center);
         }
         if (a.library.customCount() == 0) {
             const std::string tip = a.touchMode
                 ? "Tip: get mods in MOD PACKS, or copy them to " + platform::displayPath(a.base + "mods") + " and tap RESCAN"
                 : std::string("Tip: drop FNF / Psych Engine songs into the 'songs' or 'mods' folder, then press R");
-            gfx::text(FontId::Ui, tip, 40, 640, 20, fade(kIvory, 0.65f));
+            gfx::text(FontId::Ui, tip, 40, 596, 18, fade(kIvory, 0.65f));
         }
         if (!note_.empty() && a.now - noteAt_ < 4.0)
-            gfx::text(FontId::Ui, note_, 40, 600, 24, fade(kGold, float(std::min(1.0, 4.0 - (a.now - noteAt_)))), Align::Left, 1.5f);
+            gfx::text(FontId::Ui, note_, 40, 556, 22, fade(kGold, float(std::min(1.0, 4.0 - (a.now - noteAt_)))), Align::Left, 1.5f);
         if (modsOpen_) drawMods();
-        hints("ENTER play   LEFT/RIGHT difficulty   TAB modifiers   7 chart editor   M mod packs   R rescan   ESC back");
+        // bottomBG: 26px black bar + the controls tip (H-Slice's bottomText)
+        DrawRectangleRec({0, gfx::H - 40, gfx::W, 40}, Color{0, 0, 0, 150});
+        gfx::text(FontId::Ui, a.touchMode
+                      ? "Tap a song   difficulty arrows   MODIFIERS   MOD PACKS   RESCAN   BACK"
+                      : "SPACE listen   ENTER play   LEFT/RIGHT difficulty (seek while listening)   TAB modifiers   7 chart editor   M mod packs   R rescan   ESC back",
+                  gfx::W / 2, gfx::H - 33, 18, Color{220, 214, 235, 255}, Align::Center);
         gfx::endCanvas();
     }
 
@@ -573,6 +840,18 @@ private:
         if (list_.empty()) return kGold;
         return gfx::rgb(list_[size_t(app().freeplaySel)]->color);
     }
+    void seekPreview(double ms) {
+        previewCur_ = clampv(previewCur_ + ms, 0.0, previewLen_ > 0 ? previewLen_ : 1e18);
+        app().mixer.seek(previewCur_ / 1000.0);
+    }
+    void stopPreview() {
+        App& a = app();
+        a.mixer.stop();
+        previewPlaying_ = previewPaused_ = false;
+        previewCur_ = 0;
+        a.startMenuMusic();
+        sfxPlay(Sfx::Cancel);
+    }
     void drawMods() {
         const Modifiers& m = app().mods;
         DrawRectangleRec({0, 0, gfx::W, gfx::H}, Color{0, 0, 0, 150});
@@ -599,7 +878,8 @@ private:
     double selChangedAt_ = 0;
     PcmJob job_;
     std::string pendingId_, previewId_;
-    bool previewPlaying_ = false;
+    bool previewPlaying_ = false, previewPaused_ = false;
+    double previewLen_ = 0, previewCur_ = 0, scrubHold_ = 0;
     bool modsOpen_ = false;
     static constexpr int kModRows = 7;
     int modSel_ = 0;
@@ -667,6 +947,7 @@ private:
     double t0_ = 0;
 };
 
+std::unique_ptr<State> makeStartup() { return std::make_unique<StartupState>(); }
 std::unique_ptr<State> makeTitle() { return std::make_unique<TitleState>(); }
 std::unique_ptr<State> makeMainMenu() { return std::make_unique<MainMenuState>(); }
 std::unique_ptr<State> makeStory() { return std::make_unique<StoryState>(); }

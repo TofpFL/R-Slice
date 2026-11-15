@@ -84,7 +84,19 @@ raid_engine window <file.raid> <startMs> <endMs> # streaming window dump
 raid_engine meta <file.raid>                     # raw metadata JSON
 raid_engine patterns <file.raid> [startMs] [endMs]  # op-stream log: which
                                                     # pattern plays when
+raid_engine raidedit <file.raid>                   # .RAID chart editor
+raid_engine raidedit <file.raid> "cmd" "cmd" ...   # scripted edits
 ```
+
+`raidedit` edits the two structural layers without materializing huge
+patterns: `patterns`/`pattern <id>` inspect the pattern table (op lists,
+spans, stats), `spawns`/`spawn <idx>` list the timeline's pattern
+placements, and commands like `add <ms> <patId>`, `sset`, `gset`, `pdel`,
+`pset`, `pspan`, `sdel` mutate them. Every edit is validated by a full
+structural re-analysis (decode ordering, repeat spacing, chunk ranges) and
+rejected with rollback if it would corrupt the stream; `save [out.raid]`
+rewrites the file (in-place keeps a `.bak`). Overlapping placements that
+the flat op log can't express need op-3 group edits via `gset`.
 
 `gh_tests --raid <chart|flp|fsc> <out.raid>` does the same conversion with the
 compression report.

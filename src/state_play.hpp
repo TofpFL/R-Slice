@@ -34,6 +34,7 @@ public:
     TouchLayout touchLayout() const override;
     static constexpr int kPauseItems = 4;  // Resume, Restart, Options, Exit to menu
     void openChartEditor();
+    void openVisualsEditor();
     void openOptions();
     // Keys bound to a lane are notes, not volume keys.
     bool keyReserved(int key) const override {
@@ -162,6 +163,20 @@ private:
     // JS Engine events: camera twist, fake length, popups, credits, bot energy...
     bool handleJsEngineEvent(const psych::ChartEvent& e);
     void updateJsEngine(double dt);
+    // visuals.json FX clips: timed shader filters on the scene cameras.
+    void updateVisuals(double songMs);
+    void clearVisuals();
+    scene::ShaderPtr visualShader(const VisualClip& c);
+    // modchart.json modifier tracks: evaluated once per frame into mods_,
+    // then applied to cameras/characters here and to notes/strums in drawLanes.
+    void updateModchart(double songMs);
+    double modVal(const char* target, const char* prop) const;
+    std::map<std::string, std::map<std::string, double>> mods_;
+    struct VisualInst {
+        scene::ShaderPtr game, hud;  // nullptr = not on that camera
+        bool failed = false;         // shader source could not be resolved
+    };
+    std::vector<VisualInst> visuals_;  // parallel to chart_.visuals
     void drawNotices();
     void drawBotEnergy();
     double shownLengthMs() const { return fakeLenMs_ >= 0 ? fakeLenMs_ : chart_.lengthMs; }
@@ -308,6 +323,7 @@ private:
     double speedTweenFrom_ = 1, speedTweenTo_ = 1, speedTweenT_ = 0, speedTweenDur_ = 0;
     double mustHitSectionFlag_ = 1;
     bool camZoomOnBeat_ = true, cameraZoomsSet_ = false, inCutscene_ = false;
+    bool visualsOnly_ = false;  // PlayRequest::visualsOnly: notes hidden, FX/characters live
     bool zoomingOn_ = false;  // built-in camera: bops and zoom easing start at the first note hit
     int bopEvery_ = 4;
     // JS Engine events

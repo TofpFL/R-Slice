@@ -7,6 +7,7 @@
 #include "gfx.hpp"
 #include "platform.hpp"
 #include "psych_ui.hpp"
+#include "vslice_ui.hpp"
 #include "raylib.h"
 #include "synth.hpp"
 
@@ -116,6 +117,7 @@ public:
             {Row::Number, "Music volume", "", nullptr, &s.musicVol, 0, 1, 0.05f},
             {Row::Number, "Sound effects", "", nullptr, &s.sfxVol, 0, 1, 0.05f},
             {Row::Number, "Hit sounds", "A tick on every note you hit.", nullptr, &s.hitsoundVol, 0, 1, 0.05f},
+            {Row::Bool, "Mute", "Silences everything. The 0 key toggles this too.", &s.muted},
             {Row::Header, "DEBUG", ""},
             {Row::Choice, "Lua errors", "Errors of mod scripts on screen. Psych shows them only for scripts that set luaDebugMode.",
              nullptr, nullptr, 0, 0, 0, &s.luaErrors, {0, 1, 2}, {"Always", "luaDebugMode", "Off"}},
@@ -152,13 +154,43 @@ public:
             }
             rows_ = std::move(kept);
         }
+        // V-Slice options: the header rows become a left-hand tab column.
+        tabs_.clear();
+        rowTab_.assign(rows_.size(), 0);
+        int curTab = -1;
+        for (size_t i = 0; i < rows_.size(); ++i) {
+            if (rows_[i].kind == Row::Header) {
+                curTab = int(tabs_.size());
+                tabs_.push_back(rows_[i].label);
+            }
+            rowTab_[i] = std::max(0, curTab);
+        }
         sel_ = 1;
+        tabSel_ = 0;
+        rebuildVis();
+    }
+
+    void rebuildVis() {
+        vis_.clear();
+        for (size_t i = 0; i < rows_.size(); ++i)
+            if (rowTab_[i] == tabSel_ && rows_[i].kind != Row::Header) vis_.push_back(int(i));
+        if (!vis_.empty() && std::find(vis_.begin(), vis_.end(), sel_) == vis_.end()) sel_ = vis_.front();
     }
 
     void update(double dt) override {
         App& a = app();
         Input& in = a.input;
         anim_ = approach(anim_, float(sel_), 12.0f, float(dt));
+        // Tab clicks are recorded by draw() (vs::tabs paints immediately, so
+        // it cannot run here outside BeginDrawing); consume last frame's hit.
+        if (tabHit_ >= 0) {
+            if (tabHit_ != tabSel_) {
+                tabSel_ = tabHit_;
+                rebuildVis();
+                sfxPlay(Sfx::Confirm);
+            }
+            tabHit_ = -1;
+        }
         // A folder dropped on the window, or the Android picker finishing.
         if (IsFileDropped()) {
             FilePathList dropped = LoadDroppedFiles();
@@ -261,20 +293,21 @@ public:
         App& a = app();
         gfx::beginCanvas();
         drawMenuBackground(a.now, 0x5C9CFF, menuPulse());
-        gfx::text(FontId::Title, "OPTIONS", 60, 22, 48, kGold, Align::Left, 2.0f);
-        for (int i = 0; i < int(rows_.size()); ++i) {
-            const float y = 330 + (float(i) - anim_) * 48;
-            if (y < 80 || y > 640) continue;
+        gfx::text(FontId::Title, "OPTIONS", 250, 22, 48, kGold, Align::Left, 2.0f);
+        tabHit_ = vs::tabs(36, 96, 180, 46, tabs_, tabSel_);
+        // rows of the active tab only, scrolling around the selection
+        const int firstVis = vis_.empty() ? 0 : std::max(0, int(std::find(vis_.begin(), vis_.end(), sel_) - vis_.begin()) - 5);
+        float vy = 120.0f;
+        for (size_t vi = size_t(firstVis); vi < vis_.size() && vy < 660; ++vi) {
+            const int i = vis_[vi];
             const Row& r = rows_[size_t(i)];
+            const float y = vy;
+            vy += 48;
             const bool on = i == sel_;
-            const float alpha = saturate(1.0f - std::fabs(float(i) - anim_) * 0.1f);
-            if (r.kind == Row::Header) {
-                gfx::text(FontId::Title, r.label, 140, y + 2, 28, fade(kGold, alpha), Align::Left, 1.5f);
-                DrawRectangleRec({140, y + 38, 1000, 2}, fade(kGold, 0.4f * alpha));
-                continue;
-            }
-            if (on) DrawRectangleRounded({150, y - 4, 980, 44}, 0.3f, 8, Color{255, 214, 120, 40});
-            gfx::text(FontId::Ui, r.label, 180, y, 34, fade(on ? WHITE : kIvory, alpha), Align::Left, 1.5f);
+            const float alpha = 1.0f;
+            (void)alpha;
+            if (on) DrawRectangleRounded({246, y - 4, 980, 44}, 0.3f, 8, Color{255, 214, 120, 40});
+            gfx::text(FontId::Ui, r.label, 280, y, 34, fade(on ? WHITE : kIvory, alpha), Align::Left, 1.5f);
             std::string val;
             switch (r.kind) {
                 case Row::Bool: val = (r.label == "Fullscreen" ? a.settings.fullscreen : *r.b) ? "ON" : "OFF"; break;
@@ -354,11 +387,19 @@ private:
     bool pickingFolder_ = false;
 
     void move(int d) {
-        const int n = int(rows_.size());
-        do { sel_ = (sel_ + d + n) % n; } while (rows_[size_t(sel_)].kind == Row::Header);
+        if (vis_.empty()) return;
+        const int n = int(vis_.size());
+        size_t at = 0;
+        for (size_t i = 0; i < vis_.size(); ++i)
+            if (vis_[i] == sel_) at = i;
+        sel_ = vis_[size_t((int(at) + d % n + n) % n)];
         sfxPlay(Sfx::Scroll);
     }
     std::vector<Row> rows_;
+    std::vector<std::string> tabs_;
+    std::vector<int> rowTab_, vis_;
+    int tabSel_ = 0;
+    int tabHit_ = -1;
     int sel_ = 1, slot_ = 0;
     float anim_ = 1;
     bool waiting_ = false;

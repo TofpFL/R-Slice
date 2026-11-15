@@ -5,7 +5,9 @@
 #include <string>
 #include <vector>
 
+#include "modchart.hpp"
 #include "psych.hpp"
+#include "visuals.hpp"
 
 namespace gh {
 
@@ -49,6 +51,8 @@ struct Chart {
     std::string gf, stage;     // Psych scene fields (empty if absent)
     std::vector<std::string> noteTypes{""};
     std::vector<psych::ChartEvent> events;  // sorted by time
+    std::vector<VisualClip> visuals;        // visuals.json FX clips, sorted by start
+    Modchart modchart;                 // modchart.json modifier tracks + events
     int keys = 4;
     double speed = 2.0;        // FNF scroll speed (pixels/ms = 0.45 * speed)
     std::vector<Note> notes;   // sorted by time

@@ -18,6 +18,7 @@
 #include "lua_host.hpp"
 #include "psych.hpp"
 #include "scene.hpp"
+#include "visuals.hpp"
 
 using namespace gh;
 
@@ -425,12 +426,38 @@ std::string modRootOf(const fs::path& file) {
 
 }  // namespace
 
+
+void testVisuals() {
+    const char* json = R"({"version":1,"clips":[
+        {"start":1000.5,"end":5000,"target":"both","fx":"__fx_glitch","params":{"uStrength":0.7,"uSpeed":2}},
+        {"t":9000,"fx":"myshader.frag"}
+    ]})";
+    std::vector<VisualClip> clips;
+    std::string err;
+    PCHECK(parseVisuals(json, clips, err));
+    PCHECK(clips.size() == 2);
+    PCHECK(pnear(clips[0].startMs, 1000.5) && pnear(clips[0].endMs, 5000));
+    PCHECK(clips[0].target == "both" && clips[0].fx == "__fx_glitch");
+    PCHECK(pnear(clips[0].params.at("uStrength"), 0.7));
+    PCHECK(clips[1].startMs == 9000 && clips[1].endMs == 0 && clips[1].fx == "myshader.frag");
+    // Round-trip through the writer.
+    const std::string out = visualsJson(clips);
+    std::vector<VisualClip> clips2;
+    PCHECK(parseVisuals(out, clips2, err));
+    PCHECK(clips2.size() == 2 && clips2[0].fx == "__fx_glitch" && pnear(clips2[0].params.at("uSpeed"), 2));
+    // Bad input reports an error.
+    PCHECK(!parseVisuals("{\"clips\":[]}", clips, err) == false);  // empty is fine
+    PCHECK(!parseVisuals("{\"clips\":[{\"start\":0}]}", clips, err));  // no fx
+    PCHECK(!parseVisuals("not json", clips, err));
+}
+
 void runPsychTests() {
     testAtlas();
     testCharacterAndStage();
     testEventsAndMeta();
     testSceneModel();
     testLua();
+    testVisuals();
 }
 
 // Loads every atlas, character, stage and Lua script under dir.

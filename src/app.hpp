@@ -54,6 +54,9 @@ struct PlayRequest {
     long long storyMisses = 0;
     int storySongs = 0;
     double storyAccSum = 0;
+    // Visuals preview (Visuals Editor "Play song"): the song plays with its
+    // visuals.json FX and characters, but notes are not drawn.
+    bool visualsOnly = false;
 };
 
 struct ResultData {
@@ -147,6 +150,8 @@ public:
     void notify(const std::string& text, double seconds = 6.0);
     // Options opened from a song's pause menu: leaving them plays it again.
     std::unique_ptr<PlayRequest> optionsReturn;
+    // Visuals Editor opened from a song (key 8): leaving it plays the song again.
+    std::unique_ptr<PlayRequest> visualsReturn;
     // Deaths on the song played last (Psych's "Blueballed" in the pause menu).
     int blueballed = 0;
     std::string blueballedSong;
@@ -190,6 +195,7 @@ private:
 App& app();
 
 // State factories
+std::unique_ptr<State> makeStartup();
 std::unique_ptr<State> makeTitle();
 std::unique_ptr<State> makeMainMenu();
 std::unique_ptr<State> makeStory();
@@ -206,6 +212,10 @@ std::unique_ptr<State> makeEditorMenu();
 std::unique_ptr<State> makeCharacterEditor();
 std::unique_ptr<State> makeStageEditor();
 std::unique_ptr<State> makeEventEditor();
+std::unique_ptr<State> makeVisualsEditor();
+std::unique_ptr<State> makeVisualsEditorFor(const std::string& songId, const std::string& diff);
+std::unique_ptr<State> makeModchartEditor();
+std::unique_ptr<State> makeModchartEditorFor(const std::string& songId, const std::string& diff);
 
 // Waits (bounded) for detached preview/compose jobs before shutdown.
 void waitForBackgroundJobs();

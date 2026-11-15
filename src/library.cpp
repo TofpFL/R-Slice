@@ -158,14 +158,34 @@ Prepared Library::prepare(const SongEntry& e, const std::string& diff, bool mirr
         }
         if (p.chart.title.empty()) p.chart.title = e.title;
         p.chart.difficulty = diff;
-        // Psych keeps events in a separate events.json next to the charts.
+        // Psych keeps events in a separate events.json next to the charts;
+        // the Visuals Editor keeps shader/FX clips in visuals.json.
         for (const fs::path& f : listDir(toPath(e.dataDir), false)) {
-            if (!equalsI(pathStr(f.filename()), "events.json")) continue;
-            std::string evText;
-            if (readTextFile(pathStr(f), evText)) {
-                psych::parseEvents(evText, p.chart.events);
-                std::stable_sort(p.chart.events.begin(), p.chart.events.end(),
-                                 [](const psych::ChartEvent& a, const psych::ChartEvent& b) { return a.timeMs < b.timeMs; });
+            const std::string fn = pathStr(f.filename());
+            if (equalsI(fn, "events.json") || equalsI(fn, "visuals.json") || equalsI(fn, "modchart.json")) {
+                std::string text;
+                if (!readTextFile(pathStr(f), text)) continue;
+                if (equalsI(fn, "events.json")) {
+                    psych::parseEvents(text, p.chart.events);
+                    std::stable_sort(p.chart.events.begin(), p.chart.events.end(),
+                                     [](const psych::ChartEvent& a, const psych::ChartEvent& b) { return a.timeMs < b.timeMs; });
+                } else if (equalsI(fn, "visuals.json")) {
+                    std::string verr;
+                    if (parseVisuals(text, p.chart.visuals, verr) && !p.chart.visuals.empty()) {
+                        std::stable_sort(p.chart.visuals.begin(), p.chart.visuals.end(),
+                                         [](const VisualClip& a, const VisualClip& b) { return a.startMs < b.startMs; });
+                    }
+                } else {
+                    std::string merr;
+                    if (parseModchart(text, p.chart.modchart, merr) && !p.chart.modchart.tracks.empty()) {
+                        // Shader tracks embed visuals.json clips: merge them into
+                        // the visuals list so one runtime drives all FX.
+                        for (const ModTrack& tr : p.chart.modchart.tracks)
+                            if (tr.target == "shader") p.chart.visuals.push_back(tr.clip);
+                        std::stable_sort(p.chart.visuals.begin(), p.chart.visuals.end(),
+                                         [](const VisualClip& a, const VisualClip& b) { return a.startMs < b.startMs; });
+                    }
+                }
             }
         }
         {

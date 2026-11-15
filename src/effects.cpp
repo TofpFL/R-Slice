@@ -810,6 +810,16 @@ std::string_view source(std::string_view name) {
     return {};
 }
 
+std::vector<std::string> names() {
+    std::vector<std::string> out;
+    for (const Builtin& b : kBuiltins) {
+        std::string n = b.name;
+        if (n.rfind("__fx_", 0) == 0) n.erase(0, 5);
+        out.push_back(n);
+    }
+    return out;
+}
+
 bool install(scene::Scene& sc, const std::string& name) {
     if (sc.shaderSources.count(name)) return true;
     const std::string_view src = source(name);

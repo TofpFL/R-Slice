@@ -6,6 +6,7 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "scene.hpp"
 
@@ -13,6 +14,9 @@ namespace gh::fx {
 
 // Source of a built-in effect ("" if there is none by that name).
 std::string_view source(std::string_view name);
+
+// Display names of the built-in effects ("chromatic", "vcr", ...), for pickers.
+std::vector<std::string> names();
 
 // Makes sure the scene can compile `name` (a built-in effect); false if unknown.
 bool install(scene::Scene& sc, const std::string& name);

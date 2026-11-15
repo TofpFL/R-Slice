@@ -470,7 +470,8 @@ bool PlayState::setupPsych() {
     if (stageLua.empty()) stageLua = sc.files.find("stages/" + stageName + ".hx");
     baseStage_ = stageLua.empty() && basegame::stageLua(stageName) && baseStageAvailable(stageName);
     bool any = !stageJson.empty() || !stageLua.empty() || baseStage_ || !luaFilesIn(entry_->dataDir).empty() ||
-               !sc.files.list("scripts", ".lua").empty() || !sc.files.list("scripts", ".hx").empty();
+               !sc.files.list("scripts", ".lua").empty() || !sc.files.list("scripts", ".hx").empty() ||
+               !chart_.visuals.empty() || !chart_.modchart.tracks.empty();  // FX need the scene cameras
     for (const std::string& n : {playerName, oppName, gfName}) {
         if (!sc.files.find("characters/" + n + ".json").empty()) any = true;
         if (const char* base = basegame::characterJson(n)) {

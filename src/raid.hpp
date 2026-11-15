@@ -224,6 +224,16 @@ public:
     // only; chunk payloads are not touched.
     bool uniqueStats(uint64_t& events, uint64_t& notes, std::string& err);
 
+    // ---- editor access -------------------------------------------------
+    // Raw structural access for the .raid document editor (raid_doc.cpp).
+    // patternBlob() returns the decompressed pattern section INCLUDING its
+    // trailing u32 crc; patternRecs() the per-pattern table records.
+    // chunkPayloadRaw() returns chunk i's decompressed payload:
+    // u32 opCount + ops + u64 expandedCount trailer (crc verified).
+    bool patternBlob(std::vector<char>& out, std::string& err);
+    bool patternRecs(std::vector<PatternRec>& out, std::string& err);
+    bool chunkPayloadRaw(size_t i, std::vector<char>& out, std::string& err);
+
     uint64_t logicalEvents() const { return info().logicalEvents; }
 
 private:
@@ -287,6 +297,26 @@ private:
     int64_t prevPatId_ = -1;  // last pattern id; -1 right after a literal
     uint64_t instances_ = 0, changes_ = 0;
 };
+
+// One chunk as prepared by an editor: `payload` is the complete sealed
+// chunk payload (u32 opCount + ops + u64 expandedCount). firstEvent is the
+// chunk's global expanded-event index; firstTimeUs/lastTimeUs its event
+// time range (index entries require non-decreasing, non-overlapping ranges).
+struct DocChunkOut {
+    std::vector<char> payload;
+    uint64_t firstEvent = 0;
+    int64_t firstTimeUs = 0, lastTimeUs = 0;
+    uint32_t expanded = 0, opCount = 0;
+};
+
+// Writes a .raid file from editor-prepared sections: `patSection` is the
+// raw (uncompressed) pattern table (u32 count + records + u32 crc), chunks
+// carry their sealed payloads. Same layout/validation as writeRaid.
+bool writeRaidDoc(const std::string& path, const std::vector<char>& patSection,
+                  std::vector<DocChunkOut>& chunks, uint64_t logicalEvents,
+                  uint64_t literalEvents, uint64_t uniqueEvents,
+                  uint64_t uniqueNotes, std::string_view metaJson,
+                  const EncodeOptions& opt, Info* statsOut, std::string& err);
 
 // Quick magic check without parsing the index.
 bool isRaidFile(const std::string& path);
