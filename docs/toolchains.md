@@ -17,13 +17,18 @@ Output: `build_game/Release/raide.exe` (game) and `raid_engine.exe` (CLI).
 
 ## GCC (MinGW-w64)
 
-Any recent MinGW-w64 GCC works (tested: WinLibs GCC 16.2, UCRT runtime).
-CMake + Ninja or MinGW Make; raylib builds fine under MinGW.
+Verified end-to-end (WinLibs GCC 16.2, UCRT, CMake + Ninja): `raide.exe`,
+`raid_engine.exe`, and `gh_tests.exe` (6889 tests, 0 failures) all build
+and run. raylib compiles cleanly under MinGW.
 
 ```
-cmake -B build_game -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build_game
+cmake -B build_game_gcc -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build_game_gcc --config Release -j8
 ```
+
+Known cosmetic issue: the linker prints `.rsrc merge failure: multiple
+non-default manifests` but still embeds `raide.manifest` correctly
+(verified `activeCodePage`/`RAIDEngine` present in the exe).
 
 ## Clang (LLVM-MinGW)
 

@@ -5,5 +5,8 @@
 //    falls back to IDI_APPLICATION, which renders as a blank/generic icon.
 #include <windows.h>
 
-IDI_ICON1 ICON "../../assets/icon.ico"
+// NOTE: windres (MinGW) misparses a quoted-name ICON statement that follows
+// another ICON entry, so the string-named resource must come first. rc.exe
+// accepts any order.
 "GLFW_ICON" ICON "../../assets/icon.ico"
+IDI_ICON1 ICON "../../assets/icon.ico"
