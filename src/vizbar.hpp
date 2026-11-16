@@ -21,6 +21,7 @@ private:
     static constexpr int kBands = 56;
 
     float band_[kBands] = {};
+    float ref_[kBands] = {};  // per-band recent peak, for relative dynamics
     std::complex<float> fftBuf_[kFftN];
     float window_[kFftN];
     float atomSpin_ = 0;

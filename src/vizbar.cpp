@@ -46,6 +46,7 @@ void fft(std::complex<float>* a, int n) {
 
 void VizBar::reset() {
     std::fill(std::begin(band_), std::end(band_), 0.0f);
+    std::fill(std::begin(ref_), std::end(ref_), 0.0f);
     atomSpin_ = 0;
 }
 
@@ -79,9 +80,22 @@ void VizBar::update(double now, float dt) {
             double m = 0;
             for (int k = k0; k <= k1; ++k) m += std::abs(fftBuf_[k]);
             m /= std::max(1, k1 - k0 + 1);
-            // perceptual-ish scale: quiet floor, ~-46 dB .. 0 dB window
-            target[b] = float(std::clamp((std::log10(m * 90.0 + 1e-4) + 2.6) / 2.6, 0.0, 1.0));
+            // perceptual-ish scale: quiet floor, ~-46 dB .. 0 dB window;
+            // input gain kept low so loud masters sit mid-scale, not pinned
+            target[b] = float(std::clamp((std::log10(m * 2.0 + 1e-4) + 2.6) / 2.6, 0.0, 1.0));
         }
+    }
+    // Per-band dynamics: each band's level is measured against its own
+    // recent peak (attacks instantly, forgets over ~2 s) so quiet bands still
+    // move instead of being flattened by the master curve. A global gate
+    // keeps near-silence near zero.
+    float sum = 0.0f;
+    for (int b = 0; b < kBands; ++b) sum += target[b];
+    const float gate = std::clamp(sum / float(kBands) * 2.5f, 0.0f, 1.0f);
+    for (int b = 0; b < kBands; ++b) {
+        ref_[b] = std::max(target[b], ref_[b] * std::exp(-dt * 0.6f));
+        const float rel_lvl = std::clamp(target[b] / std::max(ref_[b], 1e-3f), 0.0f, 1.0f);
+        target[b] = rel_lvl * 0.85f * gate;
     }
     const float atk = std::min(1.0f, dt * 22.0f), rel = std::min(1.0f, dt * 7.0f);
     for (int b = 0; b < kBands; ++b) {

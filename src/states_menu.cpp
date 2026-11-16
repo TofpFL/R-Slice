@@ -15,6 +15,7 @@
 #include "title_atlas.hpp"
 #include "video.hpp"
 #include "vslice_ui.hpp"
+#include "fp_capsule.hpp"
 
 #ifndef GH_VERSION
 #define GH_VERSION "dev"  // set by CMake from project(VERSION)
@@ -567,7 +568,9 @@ private:
 class FreeplayState : public State {
 public:
     void enter() override {
+        fpCapsuleInit(app().base);
         rebuild();
+        initCaps();
         anim_ = float(app().freeplaySel);
         selChangedAt_ = app().now;
         bg_ = currentColor();
@@ -585,7 +588,40 @@ public:
         Input& in = a.input;
         int& sel = a.freeplaySel;
         const int n = int(list_.size());
-        anim_ = approach(anim_, float(sel), 12.0f, float(dt));
+        // V-Slice: curSelectedFractal snaps instantly; each capsule's x/y
+        // smoothLerps toward its target (CustomAnimControl::doLerp).
+        anim_ = float(sel);
+        {
+            const int dn = n + 1;
+            if (int(caps_.size()) != dn) initCaps();
+            static const float xFrames[7] = {1.7f, 1.8f, 0.85f, 0.85f, 0.97f, 0.97f, 1.0f};
+            static const float xPosLerp[7] = {0.9f, 0.4f, 0.16f, 0.16f, 0.22f, 0.22f, 0.245f};
+            for (int i = 0; i < dn; ++i) {
+                CapAnim& c = caps_[size_t(i)];
+                const float d = float(i) - anim_;
+                float tx = 270.0f + 60.0f * float(std::sin(d));
+                float ty = 120.0f + d * 115.6f;
+                // edge cull offsets (V-Slice yOffset jank, approximated)
+                if (d < 0.0f) ty -= 100.0f; else if (d > 4.0f) ty -= 10.0f;
+                c.sx = c.sy = 0.8f;
+                if (c.jumping) {
+                    c.beatAcc += float(dt);
+                    while (c.beatAcc >= 1.0f / 24.0f && c.beat < 7) {
+                        c.beatAcc -= 1.0f / 24.0f;
+                        const int b = c.beat++;
+                        c.sx = xFrames[b] * 0.8f;
+                        c.sy = (1.0f / xFrames[b]) * 0.8f;
+                        // targetPos.x = FlxG.width * xPosLerp[b]; snaps to
+                        // intendedX once it drops below the shift threshold.
+                        float px = gfx::W * xPosLerp[std::min(b, 6)];
+                        tx = px <= 320.0f ? tx : px;
+                    }
+                    if (c.beat >= 7) { c.jumping = false; c.sx = c.sy = 0.8f; }
+                }
+                c.x = smoothLerp(c.x, tx, float(dt), 0.3f);
+                c.y = smoothLerp(c.y, ty, float(dt), 0.4f);
+            }
+        }
         const Color target = currentColor();
         bg_ = gfx::mix(bg_, target, saturate(float(dt) * 4.0f));
 
@@ -614,13 +650,16 @@ public:
             if (in.back() || in.pressed(KEY_TAB)) modsOpen_ = false;
             return;
         }
-        if (n > 0 && !previewPlaying_) {  // H-Slice: selection is locked while a preview plays
-            if (in.up()) { sel = (sel + n - 1) % n; changed(); }
-            if (in.down()) { sel = (sel + 1) % n; changed(); }
-            const int nd = int(list_[size_t(sel)]->diffs.size());
-            if (nd > 0) {
-                if (in.left()) { a.freeplayDiff = (diffIndex() + nd - 1) % nd; sfxPlay(Sfx::Scroll); }
-                if (in.right()) { a.freeplayDiff = (diffIndex() + 1) % nd; sfxPlay(Sfx::Scroll); }
+        const int dn = n + 1;  // + Random capsule at index 0
+        if (dn > 0 && !previewPlaying_) {  // selection locks while a preview plays
+            if (in.up()) { sel = (sel + dn - 1) % dn; changed(); }
+            if (in.down()) { sel = (sel + 1) % dn; changed(); }
+            if (songIdx() >= 0) {
+                const int nd = int(list_[size_t(songIdx())]->diffs.size());
+                if (nd > 0) {
+                    if (in.left()) { a.freeplayDiff = (diffIndex() + nd - 1) % nd; sfxPlay(Sfx::Scroll); }
+                    if (in.right()) { a.freeplayDiff = (diffIndex() + 1) % nd; sfxPlay(Sfx::Scroll); }
+                }
             }
         }
         // MusicPlayer transport: SPACE toggles the preview, LEFT/RIGHT seek.
@@ -628,8 +667,8 @@ public:
             if (previewPlaying_) {
                 if (previewPaused_) { a.mixer.resume(); previewPaused_ = false; }
                 else { a.mixer.pause(); previewPaused_ = true; }
-            } else if (!job_.running() && a.now - selChangedAt_ > 0.2) {
-                const SongEntry* e = list_[size_t(sel)];
+            } else if (!job_.running() && a.now - selChangedAt_ > 0.2 && songIdx() >= 0) {
+                const SongEntry* e = list_[size_t(songIdx())];
                 pendingId_ = e->id;
                 const SongEntry copy = *e;
                 job_.start([copy] { return app().library.preview(copy); });
@@ -681,30 +720,46 @@ public:
             sfxPlay(Sfx::Cancel); a.change(makeMainMenu()); return;
         }
         if (in.pressed(KEY_M)) { sfxPlay(Sfx::Confirm); a.change(makeModPacks()); return; }
-        if ((in.pressed(KEY_SEVEN) || in.pressed(KEY_KP_7)) && n > 0) {  // chart editor, as in Psych
-            const SongEntry* e = list_[size_t(sel)];
+        if ((in.pressed(KEY_SEVEN) || in.pressed(KEY_KP_7)) && songIdx() >= 0) {  // chart editor
+            const SongEntry* e = list_[size_t(songIdx())];
             if (!e->diffs.empty()) {
                 sfxPlay(Sfx::Confirm);
                 a.change(makeChartEditor(e->id, e->diffs[size_t(diffIndex())]));
                 return;
             }
         }
-        if (in.accept() && n > 0 && !previewPlaying_) {
-            const SongEntry* e = list_[size_t(sel)];
-            if (!e->diffs.empty()) {
-                sfxPlay(Sfx::Confirm);
-                previewPlaying_ = previewPaused_ = false;
-                PlayRequest r;
-                r.songId = e->id;
-                r.diff = e->diffs[size_t(diffIndex())];
-                a.change(makePlay(r));
-                return;
+        if (in.accept() && dn > 0 && !previewPlaying_) {
+            if (songIdx() < 0) {
+                // Random capsule: pick any song that has charts and play it.
+                std::vector<int> ok;
+                for (int i = 0; i < int(list_.size()); ++i)
+                    if (!list_[size_t(i)]->diffs.empty()) ok.push_back(i);
+                if (!ok.empty()) {
+                    sfxPlay(Sfx::Confirm);
+                    const SongEntry* e = list_[size_t(ok[size_t(std::rand()) % ok.size()])];
+                    PlayRequest r;
+                    r.songId = e->id;
+                    r.diff = e->diffs.empty() ? std::string("Normal") : e->diffs[0];
+                    a.change(makePlay(r));
+                    return;
+                }
+            } else {
+                const SongEntry* e = list_[size_t(songIdx())];
+                if (!e->diffs.empty()) {
+                    sfxPlay(Sfx::Confirm);
+                    previewPlaying_ = previewPaused_ = false;
+                    PlayRequest r;
+                    r.songId = e->id;
+                    r.diff = e->diffs[size_t(diffIndex())];
+                    a.change(makePlay(r));
+                    return;
+                }
             }
         }
         // song preview job (started by SPACE)
         if (job_.ready()) {
             PcmPtr pcm = job_.take();
-            const SongEntry* e = n > 0 ? list_[size_t(sel)] : nullptr;
+            const SongEntry* e = songIdx() >= 0 ? list_[size_t(songIdx())] : nullptr;
             if (pcm && e && pendingId_ == e->id && !previewPlaying_) {
                 a.stopMenuMusic();
                 a.mixer.setTracks(pcm, nullptr, nullptr);
@@ -729,61 +784,55 @@ public:
         const unsigned hex = (unsigned(bg_.r) << 16) | (unsigned(bg_.g) << 8) | bg_.b;
         drawMenuBackground(now, hex, previewPlaying_ ? 0.0f : menuPulse());
         const int n = int(list_.size());
-        // ---- song carousel: H-Slice's Alphabet titles + HealthIcons --------
-        // item.x = 90 + (i - lerp) * 20 ; item.y = 320 + (i - lerp) * 156
-        const float drawDist = 4.0f;
-        for (int i = std::max(0, int(anim_) - 5); i < std::min(n, int(anim_) + 6); ++i) {
+        // ---- V-Slice capsule column -------------------------------------
+        // display index 0 = Random capsule, 1..n = songs.
+        // x = 270 + 60*sin(d) ; y = 120 + d*115.6 (docs/VSLICE_FREEPLAY_LAYOUT.md)
+        const int dn = n + 1;
+        for (int i = std::max(0, int(anim_) - 1); i < std::min(dn, int(anim_) + 7); ++i) {
+            const CapAnim& c = caps_[size_t(i)];
+            // initJumpIn: capsule+contents stay hidden for (7/24)*2.5 ~= 0.73s
+            if (now - c.spawnAt < 0.729) continue;
             const float d = float(i) - anim_;
-            if (std::fabs(d) > drawDist + 0.6f) continue;
-            const float y = 320.0f + d * 156.0f;
-            const float x = 110.0f + d * 20.0f;
+            if (d < -1.5f || d > 6.5f) continue;
+            const SongEntry* e = i == 0 ? nullptr : list_[size_t(i - 1)];
+            const float cx = c.x, cy = c.y;
             const bool on = i == a.freeplaySel;
-            const SongEntry* e = list_[size_t(i)];
-            const float ts = 58.0f;
-            const Color tc = on ? WHITE : fade(kIvory, 0.6f);
-            gfx::text(FontId::Title, e->title, x, y, ts, fade(tc, on ? 1.0f : std::max(0.25f, 0.6f - std::fabs(d) * 0.12f)), Align::Left, 2.0f);
-            const float tw = gfx::measure(FontId::Title, e->title, ts).x;
-            if (on && !e->builtin)
-                gfx::text(FontId::Ui, e->subtitle, x + 4, y + 46, 20, fade(kGold, 0.8f), Align::Left, 1.0f);
-            // HealthIcon: character icon just right of the title
-            const CharId cid = e->builtin ? charFromName(e->opponent) : CharId::Shade;
-            drawIcon(cid, gfx::rgb(e->color), {x + tw + 14, y - 18}, on ? 72.0f : 56.0f, false, now);
-        }
-        // ---- top-right: scoreText/diffText or the MusicPlayer bar -----------
-        const float px = gfx::W * 0.7f;  // 896
-        if (n > 0) {
-            const SongEntry* e = list_[size_t(a.freeplaySel)];
-            const std::string d = e->diffs.empty() ? "" : e->diffs[size_t(diffIndex())];
-            if (!previewPlaying_) {
-                // scoreBG: black bar behind the right-aligned personal best
-                DrawRectangleRec({px - 6, 0, gfx::W - px + 6, 72}, Color{0, 0, 0, 153});
-                const ScoreEntry* best = d.empty() ? nullptr : a.scores.get(Scores::key(e->id, d));
-                const std::string bs = best ? (fmtThousands(best->score) + " (" + TextFormat("%.2f%%", best->acc * 100.0) + ")")
-                                            : "-";
-                gfx::text(FontId::Ui, "PERSONAL BEST: " + bs, gfx::W - 6, 5, 30, WHITE, Align::Right, 1.5f);
-                if (!d.empty()) {
-                    std::string du = d;
-                    for (char& c : du) c = char(std::toupper((unsigned char)c));
-                    gfx::text(FontId::Ui, e->diffs.size() > 1 ? "< " + du + " >" : du, px + 140, 42, 24,
-                              diffColor(d), Align::Center, 1.5f);
+            const char* diffName = "";
+            std::string diffBuf;
+            const ScoreEntry* best = nullptr;
+            const char* rankName = "";
+            int bpm = 0;
+            const char* week = "";
+            if (e) {
+                if (const SongEntry* ce = curSong(); ce == e) {
+                    const int di = diffIndex();
+                    if (di >= 0 && di < int(e->diffs.size())) {
+                        diffBuf = e->diffs[size_t(di)];
+                        diffName = diffBuf.c_str();
+                        best = a.scores.get(Scores::key(e->id, diffBuf));
+                    }
                 }
-            } else {
-                // playbackBG + songTxt/timeTxt/progressBar (MusicPlayer)
-                DrawRectangleRec({px - 6, 0, gfx::W - px + 6, 105}, Color{0, 0, 0, 153});
+                if (best && !best->rank.empty()) rankName = best->rank.c_str();
+                bpm = e->builtin && e->def ? int(e->def->bpm + 0.5) : 0;
+                week = e->subtitle.empty() ? "" : e->subtitle.c_str();
+            }
+            fpDrawCapsule(e, diffName, rankName, bpm, week, cx, cy, on, now, i, c.sx, c.sy);
+        }
+        // ---- preview transport bar (kept until Phase 2 chrome) ------------
+        if (previewPlaying_ && n > 0) {
+            const SongEntry* e = curSong();
+            if (e) {
+                DrawRectangleRec({gfx::W * 0.7f - 6, 0, gfx::W * 0.3f + 6, 105}, Color{0, 0, 0, 153});
                 gfx::text(FontId::Ui, std::string("PLAYING: ") + e->title + (previewPaused_ ? " (PAUSED)" : ""),
                           gfx::W - 6, 5, 30, WHITE, Align::Right, 1.5f);
-                const double len = previewLen_;
-                const double cur = previewCur_;
-                auto fmtT = [](double ms) {
-                    const int s = int(ms / 1000);
-                    return TextFormat("%d:%02d", s / 60, s % 60);
-                };
+                const double len = previewLen_, cur = previewCur_;
+                auto fmtT = [](double ms) { const int s = int(ms / 1000); return TextFormat("%d:%02d", s / 60, s % 60); };
                 gfx::text(FontId::Ui, std::string(fmtT(cur)) + " / " + fmtT(len), gfx::W - 6, 44, 30, WHITE, Align::Right, 1.5f);
-                const float bx = px - 6, bw = gfx::W - px;
+                const float bx = gfx::W * 0.7f - 6, bw = gfx::W * 0.3f;
                 DrawRectangleRec({bx, 82, bw, 10}, Color{0, 0, 0, 255});
                 if (len > 0) DrawRectangleRec({bx, 82, bw * float(clampv(cur / len, 0.0, 1.0)), 10}, WHITE);
-                gfx::text(FontId::Ui, "<", px + 40, 30, 30, WHITE, Align::Center, 1.5f);
-                gfx::text(FontId::Ui, ">", px + 200, 30, 30, WHITE, Align::Center, 1.5f);
+                gfx::text(FontId::Ui, "<", bx + 40, 30, 30, WHITE, Align::Center, 1.5f);
+                gfx::text(FontId::Ui, ">", bx + 200, 30, 30, WHITE, Align::Center, 1.5f);
             }
         }
         if (a.library.customCount() == 0) {
@@ -799,7 +848,7 @@ public:
         DrawRectangleRec({0, gfx::H - 40, gfx::W, 40}, Color{0, 0, 0, 150});
         gfx::text(FontId::Ui, a.touchMode
                       ? "Tap a song   difficulty arrows   MODIFIERS   MOD PACKS   RESCAN   BACK"
-                      : "SPACE listen   ENTER play   LEFT/RIGHT difficulty (seek while listening)   TAB modifiers   7 chart editor   M mod packs   R rescan   ESC back",
+                      : "UP/DOWN select   ENTER play (Random! picks a song)   LEFT/RIGHT difficulty   SPACE listen   TAB modifiers   7 chart editor   M mod packs   R rescan   ESC back",
                   gfx::W / 2, gfx::H - 33, 18, Color{220, 214, 235, 255}, Align::Center);
         gfx::endCanvas();
     }
@@ -808,7 +857,14 @@ private:
     void rebuild() {
         list_.clear();
         for (const SongEntry& e : app().library.songs()) list_.push_back(&e);
-        app().freeplaySel = clampv(app().freeplaySel, 0, std::max(0, int(list_.size()) - 1));
+        // Display index 0 is the Random capsule; songs occupy 1..n.
+        app().freeplaySel = clampv(app().freeplaySel, 0, int(list_.size()));
+        initCaps();
+    }
+    int songIdx() const { return app().freeplaySel - 1; }  // -1 = Random
+    const SongEntry* curSong() const {
+        const int i = songIdx();
+        return i >= 0 && i < int(list_.size()) ? list_[size_t(i)] : nullptr;
     }
     void changed() {
         sfxPlay(Sfx::Scroll);
@@ -832,13 +888,14 @@ private:
         SwapScreenBuffer();
     }
     int diffIndex() const {
-        if (list_.empty()) return 0;
-        const int nd = int(list_[size_t(app().freeplaySel)]->diffs.size());
+        const int i = songIdx();
+        if (i < 0 || i >= int(list_.size())) return 0;
+        const int nd = int(list_[size_t(i)]->diffs.size());
         return nd > 0 ? clampv(app().freeplayDiff, 0, nd - 1) : 0;
     }
     Color currentColor() const {
-        if (list_.empty()) return kGold;
-        return gfx::rgb(list_[size_t(app().freeplaySel)]->color);
+        const SongEntry* e = curSong();
+        return e ? gfx::rgb(e->color) : kGold;
     }
     void seekPreview(double ms) {
         previewCur_ = clampv(previewCur_ + ms, 0.0, previewLen_ > 0 ? previewLen_ : 1e18);
@@ -873,6 +930,35 @@ private:
     }
 
     std::vector<const SongEntry*> list_;
+    // Per-capsule animation state (port of CustomAnimControl).
+    struct CapAnim {
+        float x = 0, y = 0;
+        float sx = 0.8f, sy = 0.8f;   // current squash scale
+        double spawnAt = 0;           // app now when spawned
+        bool jumping = false;
+        float beatAcc = 0;
+        int beat = 0;                 // 0..7 jump-in beats at 24fps
+    };
+    std::vector<CapAnim> caps_;
+    void initCaps() {
+        const int dn = int(list_.size()) + 1;
+        caps_.assign(size_t(dn), CapAnim{});
+        for (int i = 0; i < dn; ++i) {
+            CapAnim& c = caps_[size_t(i)];
+            c.x = gfx::W;                       // initPosition(FlxG.width, 0)
+            c.y = 120.0f + float(i - app().freeplaySel) * 115.6f + 10.0f;
+            c.spawnAt = app().now;
+            c.jumping = true;
+            c.beatAcc = 0;
+            c.beat = 0;
+        }
+    }
+    // MathUtil.smoothLerp port: exponential approach, snaps within 1%.
+    static float smoothLerp(float cur, float target, float elapsed, float duration) {
+        if (cur == target) return target;
+        const float r = cur + (target - cur) * (1.0f - std::pow(0.01f, elapsed / duration));
+        return std::fabs(r - target) < 0.01f * std::fabs(target) ? target : r;
+    }
     float anim_ = 0;
     Color bg_ = kGold;
     double selChangedAt_ = 0;

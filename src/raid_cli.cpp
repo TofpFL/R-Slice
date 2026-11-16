@@ -1,4 +1,4 @@
-﻿// raid_engine: standalone RAID Engine command line tool (no raylib).
+// raid_engine: standalone RAID Engine command line tool (no raylib).
 //
 //   raid_engine convert <chart|flp|fsc> <out.raid>   encode a chart to .raid
 //   raid_engine info <file.raid>                     header + encoder stats

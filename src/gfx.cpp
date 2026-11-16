@@ -10,8 +10,8 @@
 namespace gh::gfx {
 
 namespace {
-Font g_title{}, g_ui{};
-bool g_titleOwned = false, g_uiOwned = false;
+Font g_title{}, g_ui{}, g_vcr{}, g_pixel{};
+bool g_titleOwned = false, g_uiOwned = false, g_vcrOwned = false, g_pixelOwned = false;
 Texture2D g_glow{};
 Texture2D g_note[5]{};
 Texture2D g_receptor[2]{};  // arrow, diamond
@@ -95,13 +95,20 @@ Font loadFont(const std::string& path, int size, bool& owned) {
 
 }  // namespace
 
-const Font& fontOf(FontId f) { return f == FontId::Title ? g_title : g_ui; }
+const Font& fontOf(FontId f) {
+    if (f == FontId::Title) return g_title;
+    if (f == FontId::Vcr) return g_vcr;
+    if (f == FontId::Pixel) return g_pixel;
+    return g_ui;
+}
 
 float randf(float lo, float hi) { return lo + (hi - lo) * float(std::rand()) / float(RAND_MAX); }
 
 void init(const std::string& baseDir) {
     g_title = loadFont(baseDir + "assets/fonts/CinzelDecorative-Bold.ttf", 112, g_titleOwned);
     g_ui = loadFont(baseDir + "assets/fonts/Rajdhani-Bold.ttf", 72, g_uiOwned);
+    g_vcr = loadFont(baseDir + "assets/fonts/vcr.ttf", 72, g_vcrOwned);
+    g_pixel = loadFont(baseDir + "assets/fonts/5by7.ttf", 72, g_pixelOwned);
 
     Image gi = GenImageColor(128, 128, BLANK);
     Color* px = static_cast<Color*>(gi.data);
@@ -125,6 +132,8 @@ void init(const std::string& baseDir) {
 void shutdown() {
     if (g_titleOwned) UnloadFont(g_title);
     if (g_uiOwned) UnloadFont(g_ui);
+    if (g_vcrOwned) UnloadFont(g_vcr);
+    if (g_pixelOwned) UnloadFont(g_pixel);
     UnloadTexture(g_glow);
     for (auto& t : g_note) UnloadTexture(t);
     for (auto& t : g_receptor) UnloadTexture(t);

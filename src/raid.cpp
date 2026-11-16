@@ -1,4 +1,4 @@
-﻿// RAID Engine: .raid binary chart format â€” writer, streaming reader,
+// RAID Engine: .raid binary chart format â€” writer, streaming reader,
 // pattern-matching encoder. See raid.hpp for the format overview.
 //
 // Op encoding inside chunk/pattern payloads (all LEB128 varints, signed
@@ -922,6 +922,36 @@ struct ChunkOut {
 };
 
 // Compresses chunk payloads + meta + pattern section and writes the whole
+// Returns true if a sealed chunk payload (u32 opCount + ops + u64 expanded)
+// contains op kinds introduced in format v2 (group/burst). Used to pick the
+// lowest format version that can express the file, so v1-only content stays
+// readable by older builds.
+bool payloadHasV2Ops(const std::vector<char>& p) {
+    if (p.size() < 12) return false;
+    Cur cur{p.data(), p.data() + p.size()};
+    const uint32_t opCount = uint32_t(cur.u32());
+    const char* opsEnd = p.data() + p.size() - 8;  // expanded-count trailer
+    for (uint32_t o = 0; o < opCount; ++o) {
+        if (!cur.ok || cur.p >= opsEnd) return false;
+        const uint8_t kind = cur.u8();
+        if (kind == kOpLiteralAbs || kind == kOpLiteralRel) {
+            const uint32_t n = uint32_t(cur.u32());
+            // 7 varint columns of n events: time, length, pitch, lane,
+            // attr, type, stack.
+            for (uint32_t k = 0; k < n * 7u; ++k) (void)cur.var();
+        } else if (kind == kOpPattern) {
+            (void)cur.u32(); (void)cur.u32();
+            for (int i = 0; i < 3; ++i) (void)cur.var();
+        } else if (kind == kOpBurst || kind == kOpGroup) {
+            return true;
+        } else {
+            return false;
+        }
+        if (!cur.ok || cur.p > opsEnd) return false;
+    }
+    return false;
+}
+
 // .raid file (header, index, sections, chunks). Shared by writeRaid and the
 // FL Studio playlist encoder.
 bool writeRaidDone(const std::string& path, const std::vector<char>& patSection,
@@ -997,9 +1027,15 @@ bool writeRaidDone(const std::string& path, const std::vector<char>& patSection,
     const uint64_t patOffAbs = metaOffAbs + metaStored.size();
     uint64_t chunkOffAbs = patOffAbs + patStored.size();
 
+    // Emit the lowest version that expresses this file: v1 when no chunk
+    // uses group/burst ops, v2 otherwise.
+    uint32_t outVersion = kMinVersion;
+    for (const ChunkOut& c : chunks)
+        if (payloadHasV2Ops(c.payload.b)) { outVersion = kVersion; break; }
+
     Buf hdr;
     hdr.raw(kMagic, 4);
-    hdr.u32(kVersion);
+    hdr.u32(outVersion);
     hdr.u32(0);                     // flags
     hdr.u32(0);                     // reserved (keyCount lives in meta)
     hdr.u32(0);                     // reserved
@@ -1050,7 +1086,7 @@ bool writeRaidDone(const std::string& path, const std::vector<char>& patSection,
     if (!ok) { err = "write failed: " + path; return false; }
 
     if (statsOut) {
-        statsOut->version = kVersion;
+        statsOut->version = outVersion;
         statsOut->flags = 0;
         statsOut->keyCount = 0;
         statsOut->logicalEvents = logicalN;
@@ -2044,7 +2080,7 @@ struct Reader::Impl {
         uint32_t storedCrc = uint32_t(c.u32());
         c.u32();
         if (!c.ok) { err = "bad raid header"; return false; }
-        if (info_.version != kVersion) {
+        if (info_.version < kMinVersion || info_.version > kVersion) {
             err = "unsupported raid version " + std::to_string(info_.version);
             return false;
         }

@@ -43,7 +43,7 @@ Vector2 canvasOrigin();  // window position of canvas point (0, 0)
 Vector2 toCanvas(Vector2 windowPos);
 
 // ---- text
-enum class FontId { Title, Ui };
+enum class FontId { Title, Ui, Vcr, Pixel };
 enum class Align { Left, Center, Right };
 void text(FontId f, std::string_view s, float x, float y, float size, Color c, Align a = Align::Left,
           float outline = 0.0f, Color outlineColor = {10, 6, 18, 255});

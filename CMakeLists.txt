@@ -224,6 +224,7 @@ if(GH_BUILD_GAME)
     src/states_menu.cpp
     src/title_atlas.cpp
   src/vslice_ui.cpp
+  src/fp_capsule.cpp
     src/states_options.cpp
     src/state_play.cpp
     src/vizbar.cpp

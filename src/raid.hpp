@@ -44,7 +44,12 @@ namespace gh { struct FlpProject; }
 
 namespace gh::raid {
 
-constexpr uint32_t kVersion = 1;
+// v2: chunk ops extended with op-3 (pattern groups) and op-4 (bursts).
+// v1 files only contain ops 0-2, which decode identically, so the reader
+// accepts both; writers always emit kVersion so older builds reject new
+// files up front instead of failing mid-decode with "unknown op kind".
+constexpr uint32_t kVersion = 2;
+constexpr uint32_t kMinVersion = 1;
 constexpr char kMagic[4] = {'R', 'A', 'I', 'D'};
 constexpr size_t kHeaderSize = 128;
 constexpr size_t kIndexEntrySize = 56;
