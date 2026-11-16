@@ -1,13 +1,13 @@
 # R-Slice (AKA: RAID Engine)
 
 A binary chart format and streaming playback engine for rhythm games, built for
-**extraordinarily dense FNF-style charts — trillions of note events without ever
+**extraordinarily dense FNF charts — trillions of note events without ever
 loading them into memory**. It targets sustained 120–240 FPS playback, bounded
 RAM regardless of chart length, lossless chart data, and random access.
 
-RAID Engine powers **God's Hand of Principality and Demise** (`godshand`), a
+RAID Engine takes its roots from **God's Hand of Principality and Demise** (`godshand`), a
 C++20 Friday Night Funkin'-style rhythm duel with full Psych Engine mod support —
-the game is the reference host; the engine is the point.
+the game is the reference host and temporary stabilization; the engine is the point.
 
 ## The `.raid` format (`src/raid.{hpp,cpp}`)
 
