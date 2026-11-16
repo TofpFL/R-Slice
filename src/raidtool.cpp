@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <cstring>
@@ -260,8 +261,11 @@ static int run() {
     sfx.init(base);
     sfx.play(sfx.openApp);
 
-    Log log;
-    Job job;
+    // static: Job::run() detaches its worker, which captures these by
+    // reference - they must outlive run() or the worker writes to dead
+    // stack frames on window close.
+    static Log log;
+    static Job job;
     Input pathIn, argsIn;
     Rectangle logRect{};
     float logScroll = 0;
@@ -314,7 +318,7 @@ static int run() {
         // ---- input focus ----
         static Rectangle s_pathRect{}, s_argsRect{};
         if (!tourActive) {
-            if (CheckCollisionPointRec(GetMousePosition(), s_pathRect)) pathIn.focused = true;
+            if (CheckCollisionPointRec(GetMousePosition(), s_pathRect)) { pathIn.focused = true; argsIn.focused = false; }
             else if (CheckCollisionPointRec(GetMousePosition(), s_argsRect)) { argsIn.focused = true; pathIn.focused = false; }
             else if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) { pathIn.focused = argsIn.focused = false; }
             if (pathIn.focused) pathIn.handle();
@@ -356,10 +360,16 @@ static int run() {
                                     pathIn.focused ? Color{120, 220, 255, 255} : Color{60, 80, 120, 255});
         std::string shown = pathIn.text;
         if (pathIn.focused) {
-            const int cp = int(MeasureTextEx(font, shown.substr(0, size_t(pathIn.caret)).c_str(), 17, 1).x);
-            shown += "|";
-            DrawTextEx(font, shown.c_str(), {s_pathRect.x + 10, s_pathRect.y + 9}, 17, 1, WHITE);
-            (void)cp;
+            const std::string before = shown.substr(0, size_t(pathIn.caret));
+            const std::string after = shown.substr(size_t(pathIn.caret));
+            const float x0 = s_pathRect.x + 10, y0 = s_pathRect.y + 9;
+            const float caretW = MeasureTextEx(font, "|", 17, 1).x;
+            DrawTextEx(font, before.c_str(), {x0, y0}, 17, 1, WHITE);
+            const float cx = x0 + MeasureTextEx(font, before.c_str(), 17, 1).x;
+            // blinking caret between before/after
+            if (std::fmod(GetTime(), 1.0) < 0.6)
+                DrawTextEx(font, "|", {cx, y0}, 17, 1, Color{120, 220, 255, 255});
+            DrawTextEx(font, after.c_str(), {cx + caretW, y0}, 17, 1, WHITE);
         } else {
             DrawTextEx(font, shown.empty() ? "chart.json / .flp / .fsc / .raid / folder..." : shown.c_str(),
                        {s_pathRect.x + 10, s_pathRect.y + 9}, 17, 1,

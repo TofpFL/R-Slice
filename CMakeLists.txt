@@ -288,6 +288,9 @@ if(GH_BUILD_GAME)
   # raidtool: GUI front-end that shells out to raid_engine.exe.
   if(WIN32)
     add_executable(raidtool WIN32 src/raidtool.cpp src/raidtool_pick.cpp)
+    # the GUI shells out to raid_engine.exe - always build it alongside,
+    # even when raidtool is the only requested target
+    add_dependencies(raidtool raid_engine)
     target_link_libraries(raidtool PRIVATE raylib comdlg32 shell32 ole32)
     if(MSVC)
       target_link_options(raidtool PRIVATE /ENTRY:mainCRTStartup)
