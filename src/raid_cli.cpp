@@ -101,6 +101,28 @@ static int info(const std::string& path) {
     return 0;
 }
 
+// Detects files whose stamped format version is lower than what their
+// chunk ops require (v1 stamp hiding op-3/op-4). Prints a warning with the
+// exact upgrade command. Silent when the label is correct.
+static void warnIfMislabeled(const std::string& path) {
+    raid::Reader rd;
+    std::string err;
+    if (!rd.open(path, err)) return;  // verify() already reported open errors
+    const uint32_t stored = rd.info().version;
+    uint32_t need = raid::kMinVersion;
+    const uint64_t nc = rd.info().chunkCount;
+    for (uint64_t i = 0; i < nc; ++i) {
+        std::vector<char> p;
+        if (!rd.chunkPayloadRaw(size_t(i), p, err)) break;
+        need = std::max(need, raid::chunkPayloadVersion(p));
+    }
+    rd.close();
+    if (stored < need)
+        std::printf("WARNING: File contains v%u operations but is stamped v%u.\n"
+                    "Run: raid_engine upgrade \"%s\"\n",
+                    need, stored, path.c_str());
+}
+
 static int verify(const std::string& path) {
     Chart c;
     std::string err;
@@ -110,6 +132,7 @@ static int verify(const std::string& path) {
     }
     std::printf("%s: %zu notes, title \"%s\", %.0f ms\n", path.c_str(), c.notes.size(),
                 c.title.c_str(), c.lengthMs);
+    warnIfMislabeled(path);
     return 0;
 }
 
