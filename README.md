@@ -1,4 +1,4 @@
-# RAID Engine
+# R-Slice (AKA: RAID Engine)
 
 A binary chart format and streaming playback engine for rhythm games, built for
 **extraordinarily dense FNF-style charts — trillions of note events without ever
