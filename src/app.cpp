@@ -289,7 +289,7 @@ int App::run(int argc, char** argv) {
     SetTraceLogLevel(LOG_WARNING);
     // Android: the whole screen, whatever its size.
     InitWindow(platform::kAndroid ? 0 : std::max(320, winW_), platform::kAndroid ? 0 : std::max(180, winH_),
-               "RAID Engine");
+               "R-Slice");
     platform::afterWindowInit();
     platform::setWindowIcon();
     platform::setVsync(settings.vsync);  // explicit both ways: some drivers default to on

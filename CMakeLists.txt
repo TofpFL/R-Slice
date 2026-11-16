@@ -285,6 +285,22 @@ if(GH_BUILD_GAME)
     target_link_libraries(raide PRIVATE shell32 ole32 opengl32)  # the folder dialog; the FPS counter's graphics card name
   endif()
 
+  # raidtool: GUI front-end that shells out to raid_engine.exe.
+  if(WIN32)
+    add_executable(raidtool WIN32 src/raidtool.cpp src/raidtool_pick.cpp)
+    target_link_libraries(raidtool PRIVATE raylib comdlg32 shell32 ole32)
+    if(MSVC)
+      target_link_options(raidtool PRIVATE /ENTRY:mainCRTStartup)
+      target_compile_options(raidtool PRIVATE /W3 /utf-8)
+    else()
+      target_compile_options(raidtool PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+    add_custom_command(TARGET raidtool POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:raidtool>/assets
+      COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/assets/tool_sfx $<TARGET_FILE_DIR:raidtool>/assets/tool_sfx
+      COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/assets/fonts $<TARGET_FILE_DIR:raidtool>/assets/fonts)
+  endif()
+
   # Runtime layout next to the executable: assets/, songs/, mods/
   if(NOT ANDROID)
     add_custom_command(TARGET raide POST_BUILD

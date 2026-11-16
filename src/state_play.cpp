@@ -266,8 +266,20 @@ void PlayState::update(double dt) {
         }
     }
     const double audioEnd = prep_.inst ? a.mixer.lengthSec() * 1000.0 : 0.0;
-    const double endAt = std::max(chart_.lengthMs + 800.0 * rate_, std::min(audioEnd, chart_.lengthMs + 8000.0 * rate_));
-    if ((songMs_ >= endAt && session_.allResolved()) || songMs_ > chart_.lengthMs + 20000.0) finish();
+    // R-Slice: the track's length decides when the song ends. A chart that
+    // runs shorter than the audio no longer cuts the music off early; the
+    // chart length is only a floor (and the fallback when there is no inst).
+    const double songEnd = audioEnd > 0 ? std::max(audioEnd, chart_.lengthMs) : chart_.lengthMs;
+    const double endAt = songEnd + 800.0 * rate_;
+    // mixer.time() freezes at the stream end, so "audio finished" is checked
+    // on the raw position instead of the smoothed song clock.
+    const bool audioDone = prep_.inst && a.mixer.ended();
+    // Wall-clock cap: a chart longer than the audio can leave songMs frozen
+    // below every ms-based threshold - bail out on real elapsed time.
+    const bool wallCap = songStarted_ && now - songStartAt_ > songEnd / 1000.0 / std::max(0.1, rate_) + 30.0;
+    if ((songMs_ >= endAt && session_.allResolved()) ||
+        (audioDone && session_.allResolved()) ||
+        songMs_ > songEnd + 20000.0 || wallCap) finish();
 }
 
 void PlayState::draw() {
