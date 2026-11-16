@@ -249,7 +249,7 @@ void Session::gcBefore(double songMs) {
             v.erase(v.begin(), v.begin() + keepFrom);
             if (cursor_[s][l] >= keepFrom) cursor_[s][l] -= keepFrom;
             else cursor_[s][l] = 0;
-            if (activeHold_[s][l] >= 0) activeHold_[s][l] -= long long(keepFrom);
+            if (activeHold_[s][l] >= 0) activeHold_[s][l] -= int64_t(keepFrom);
         }
     }
 }

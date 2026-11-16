@@ -9,6 +9,7 @@
 //                                                    pattern plays when
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <cstdio>

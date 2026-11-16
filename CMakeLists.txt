@@ -71,7 +71,10 @@ target_include_directories(gh_miniz PUBLIC ${miniz_SOURCE_DIR} ${CMAKE_SOURCE_DI
 if(MSVC)
   target_compile_definitions(gh_miniz PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
-  target_compile_options(gh_miniz PRIVATE -w)
+  # miniz_tdef.c relies on a C89-style tentative definition + later
+  # definition of s_tdefl_num_probes; strict C99+/C++ rejects it. MSVC
+  # accepts it as an extension; GCC/Clang need C89 dialect for this lib.
+  target_compile_options(gh_miniz PRIVATE -w -std=gnu89)
 endif()
 
 # ---- pl_mpeg (MPEG-1 video for cutscenes) -----------------------------------------
