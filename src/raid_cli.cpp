@@ -23,6 +23,7 @@
 #include "chart.hpp"
 #include "chart_stream.hpp"
 #include "flp_import.hpp"
+#include "miniz.h"
 #include "raid.hpp"
 #include "raid_chart.hpp"
 #include "raid_doc.hpp"
@@ -818,6 +819,93 @@ int raidedit(int argc, char** argv) {
 
 }  // namespace
 
+// Re-stamps a .raid file's format version to the minimum its chunk ops
+// require. Files written between the op-3/op-4 encoder commits and the v2
+// bump are stamped v1 but contain v2 ops; older builds reject them with
+// "unknown op kind". The fix is header-only: bump the version u32 at
+// offset 4 and rewrite the header CRC - payloads are untouched, so the
+// upgrade is lossless and instant even on huge files. Files already at
+// the right version (or pure v1 content) are left alone.
+static int upgradeOne(const std::string& path) {
+    raid::Reader rd;
+    std::string err;
+    if (!rd.open(path, err)) {
+        std::printf("%s: open failed: %s\n", path.c_str(), err.c_str());
+        return 1;
+    }
+    uint32_t need = raid::kMinVersion;
+    const uint64_t nc = rd.info().chunkCount;
+    for (uint64_t i = 0; i < nc; ++i) {
+        std::vector<char> p;
+        if (!rd.chunkPayloadRaw(size_t(i), p, err)) {
+            std::printf("%s: chunk %llu: %s\n", path.c_str(),
+                        (unsigned long long)i, err.c_str());
+            rd.close();
+            return 1;
+        }
+        need = std::max(need, raid::chunkPayloadVersion(p));
+    }
+    rd.close();
+
+    FILE* f = std::fopen(path.c_str(), "r+b");
+    if (!f) {
+        std::printf("%s: cannot open for update\n", path.c_str());
+        return 1;
+    }
+    unsigned char h[raid::kHeaderSize];
+    if (std::fread(h, 1, raid::kHeaderSize, f) != raid::kHeaderSize ||
+        std::memcmp(h, raid::kMagic, 4) != 0) {
+        std::printf("%s: not a raid file\n", path.c_str());
+        std::fclose(f);
+        return 1;
+    }
+    const uint32_t stored = uint32_t(h[4]) | (uint32_t(h[5]) << 8) |
+                            (uint32_t(h[6]) << 16) | (uint32_t(h[7]) << 24);
+    if (stored >= need) {
+        std::printf("%s: already version %u (needs %u) - unchanged\n",
+                    path.c_str(), stored, need);
+        std::fclose(f);
+        return 0;
+    }
+    h[4] = char(need); h[5] = char(need >> 8);
+    h[6] = char(need >> 16); h[7] = char(need >> 24);
+    h[108] = h[109] = h[110] = h[111] = 0;
+    const mz_ulong crc = mz_crc32(0, h, raid::kHeaderSize);
+    h[108] = char(crc); h[109] = char(crc >> 8);
+    h[110] = char(crc >> 16); h[111] = char(crc >> 24);
+    if (std::fseek(f, 0, SEEK_SET) != 0 ||
+        std::fwrite(h, 1, raid::kHeaderSize, f) != raid::kHeaderSize) {
+        std::printf("%s: write failed\n", path.c_str());
+        std::fclose(f);
+        return 1;
+    }
+    std::fclose(f);
+    std::printf("%s: version %u -> %u\n", path.c_str(), stored, need);
+    return 0;
+}
+
+static int upgradeCmd(int argc, char** argv) {
+    int fails = 0, done = 0;
+    for (int i = 0; i < argc; ++i) {
+        const std::string p = argv[i];
+        std::error_code ec;
+        if (std::filesystem::is_directory(p, ec)) {
+            for (const auto& de : std::filesystem::recursive_directory_iterator(p, ec)) {
+                if (de.is_regular_file(ec) &&
+                    de.path().extension() == ".raid") {
+                    fails += upgradeOne(de.path().string()) != 0;
+                    ++done;
+                }
+            }
+        } else {
+            fails += upgradeOne(p) != 0;
+            ++done;
+        }
+    }
+    std::printf("%d file(s) checked, %d failed\n", done, fails);
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 3) {
@@ -829,7 +917,8 @@ int main(int argc, char** argv) {
                     "  raid_engine meta <file.raid>\n"
                     "  raid_engine patterns <file.raid> [startMs] [endMs]\n"
                     "  raid_engine streamtest <file.raid>\n"
-                    "  raid_engine rchr pack|list|unpack ...\n");
+                    "  raid_engine rchr pack|list|unpack ...\n"
+                    "  raid_engine upgrade <file|dir>...   re-stamp format version\n");
         return argc < 2 ? 2 : 1;
     }
     const std::string cmd = argv[1];
@@ -844,6 +933,7 @@ int main(int argc, char** argv) {
         return patterns(argv[2], argc >= 4 ? argv[3] : nullptr,
                         argc >= 5 ? argv[4] : nullptr);
     if (cmd == "raidedit" && argc >= 3) return raidedit(argc, argv);
+    if (cmd == "upgrade" && argc >= 3) return upgradeCmd(argc - 2, argv + 2);
     std::printf("unknown or incomplete command\n");
     return 2;
 }

@@ -1105,6 +1105,14 @@ bool writeRaidDone(const std::string& path, const std::vector<char>& patSection,
 
 // ------------------------------------------------------------ public API ---
 
+// Minimum format version that can express a sealed chunk payload
+// (u32 opCount + ops + u64 expanded trailer): 2 when it uses group/burst
+// ops, 1 otherwise. Used by writeRaidDone and by `raid_engine upgrade` to
+// re-stamp mislabeled files losslessly.
+uint32_t chunkPayloadVersion(const std::vector<char>& payload) {
+    return payloadHasV2Ops(payload) ? kVersion : kMinVersion;
+}
+
 bool isRaidFile(const std::string& path) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;

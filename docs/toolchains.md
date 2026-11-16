@@ -71,5 +71,10 @@ It is almost never the compiler. Check, in order:
    (contain op-3 group / op-4 burst ops, produced by `.flp`/`.fsc`
    converts) require a build from after the v2 bump; v1 files load on
    any build.
-2. Stale binary — rebuild from current `main`.
-3. Corrupt/truncated copy — `verify` reports checksum errors.
+2. **Mislabeled v1 files**: `.flp`/`.fsc` converts made between the
+   op-3/op-4 encoder commits and the v2 bump are stamped v1 but contain
+   v2 ops — old builds reject them with `unknown op kind`. Fix in place
+   with `raid_engine upgrade <file.raid>` or `raid_engine upgrade <dir>`
+   (recursive, header-only rewrite, lossless, leaves pure-v1 files at v1).
+3. Stale binary — rebuild from current `main`.
+4. Corrupt/truncated copy — `verify` reports checksum errors.

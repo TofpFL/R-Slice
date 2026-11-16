@@ -323,6 +323,10 @@ bool writeRaidDoc(const std::string& path, const std::vector<char>& patSection,
                   uint64_t uniqueNotes, std::string_view metaJson,
                   const EncodeOptions& opt, Info* statsOut, std::string& err);
 
+// Minimum format version a sealed chunk payload requires (1 or kVersion).
+// See raid.cpp payloadHasV2Ops.
+uint32_t chunkPayloadVersion(const std::vector<char>& payload);
+
 // Quick magic check without parsing the index.
 bool isRaidFile(const std::string& path);
 
