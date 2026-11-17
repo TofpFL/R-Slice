@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 
 #include "common.hpp"
 
@@ -181,14 +182,24 @@ bool readFlp(std::string_view bytes, FlpProject& out, std::string& err) {
         uint32_t prevValue = 0, lastChannel = 0;
         size_t chanEvents = 0;
         bool fpcFound = false, chanCtx = false;
+        // Pattern lookup must be O(1): large projects carry tens of
+        // thousands of patterns and every note-name/length event resolves
+        // through here — a linear scan made parsing quadratic.
+        std::unordered_map<int, size_t> patIdx;
         auto pattern = [&](int number) -> FlpPattern& {
-            for (FlpPattern& p : out.patterns)
-                if (p.number == number) return p;
+            const auto it = patIdx.find(number);
+            if (it != patIdx.end()) return out.patterns[it->second];
             out.patterns.push_back(FlpPattern{number, {}, {}});
+            patIdx.emplace(number, out.patterns.size() - 1);
             return out.patterns.back();
         };
+        size_t evCount = 0;
         while (i < end) {
+            if ((++evCount & 0x3FFFFF) == 0)
+                std::fprintf(stderr, "[flp] %lluM events at %zu/%zu\n",
+                             (unsigned long long)(evCount >> 20), i, end);
             const uint8_t id = b[i++];
+            const size_t evStart = i - 1;
             uint32_t value = 0;
             const unsigned char* data = nullptr;
             size_t len = 0;
@@ -240,6 +251,8 @@ bool readFlp(std::string_view bytes, FlpProject& out, std::string& err) {
                     if (!chanCtx) pattern(curPattern).lengthTicks = value;
                     break;
                 case kPlaylist: {
+                if (out.playlistBlobs == 0)
+                    std::fprintf(stderr, "[flp] first playlist @%zu len=%zu\n", evStart, len);
                 // FL grew the playlist record across versions (32/60/88/... bytes).
                 // Detect the stride structurally: at the right size, records
                 // whose item_index tops PATTERN_BASE almost all carry
@@ -266,6 +279,18 @@ bool readFlp(std::string_view bytes, FlpProject& out, std::string& err) {
                 if (!rec) rec = len % 60 == 0 && len >= 60 ? 60 : 32;
                 ++out.playlistBlobs;
                 out.playlistBytes += len;
+                if (getenv("FLP_DEBUG") && out.playlistBlobs <= 2) {
+                    std::fprintf(stderr, "[flp] playlist blob %d: len=%zu rec=%zu items=%zu skipped=%d\n",
+                                 out.playlistBlobs, len, rec, (len - len % rec) / rec,
+                                 out.playlistSkipped);
+                    for (size_t k = 0; k + rec <= len && k < rec * 6; k += rec) {
+                        const unsigned char* r = data + k;
+                        std::fprintf(stderr, "  rec%zu pos=%d item=%d len=%d track=%d flags=%04x\n",
+                                     k / rec, int32_t(rd32(r)), int16_t(rd16(r + 6)),
+                                     int32_t(rd32(r + 8)), int16_t(rd16(r + 12)),
+                                     uint16_t(rd16(r + 18)));
+                    }
+                }
                 for (size_t k = 0; k + rec <= len; k += rec) {
                     const unsigned char* r = data + k;
                     const int32_t pos = int32_t(rd32(r));
@@ -305,6 +330,8 @@ bool readFlp(std::string_view bytes, FlpProject& out, std::string& err) {
                 }
                 break;
             }            case kNoteData: {
+                    if (getenv("FLP_DEBUG"))
+                        std::fprintf(stderr, "[flp] notedata @%zu len=%zu pat=%d\n", evStart, len, curPattern);
                     FlpPattern& p = pattern(curPattern);
                     for (size_t k = 0; k + kNoteSize <= len; k += kNoteSize) {
                         const unsigned char* r = data + k;
@@ -334,13 +361,23 @@ bool readFlp(std::string_view bytes, FlpProject& out, std::string& err) {
             prevValue = value;
         }
         std::sort(out.patterns.begin(), out.patterns.end(), [](const FlpPattern& a, const FlpPattern& c) { return a.number < c.number; });
+        size_t noteCount = 0;
+        for (const FlpPattern& p : out.patterns) noteCount += p.notes.size();
+        std::fprintf(stderr,
+                     "[flp] pass acByte=%d: chan=%zu/%d patterns=%zu notes=%zu playlist=%zu\n",
+                     int(acByte), chanEvents, wantChannels, out.patterns.size(),
+                     noteCount, out.playlist.size());
         return chanEvents;
     };
 
     const size_t classic = parsePass(false);
+    std::fprintf(stderr, "[flp] classic pass: %zu chan events (want %d), %zu patterns\n",
+                 classic, wantChannels, out.patterns.size());
     if (wantChannels < 0 || classic == size_t(wantChannels)) return true;
     // Classic framing desynced: FL 2025+ writes 0xAC as a byte event.
     const size_t quirky = parsePass(true);
+    std::fprintf(stderr, "[flp] quirky pass: %zu chan events, %zu patterns\n",
+                 quirky, out.patterns.size());
     if (wantChannels < 0 || quirky == size_t(wantChannels)) return true;
     parsePass(false);  // neither framing validated: keep the classic result
     return true;

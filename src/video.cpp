@@ -155,6 +155,19 @@ std::string findFfmpeg(const std::string& baseDir) {
 
 }  // namespace
 
+// True when `path` opens as a playable MPEG stream (used to adopt a
+// finished-but-unrenamed .part file).
+bool probeMpeg(const std::string& path) {
+    FILE* f = openRead(path);
+    if (!f) return false;
+    plm_t* p = plm_create_with_file(f, 1);
+    if (!p) return false;
+    const bool ok = plm_probe(p, 5000 * 1024) && plm_get_num_video_streams(p) > 0 &&
+                    plm_get_width(p) > 0 && plm_get_height(p) > 0;
+    plm_destroy(p);
+    return ok;
+}
+
 VideoSource findVideo(const scene::Files& files, const std::string& nameIn, const std::string& baseDir) {
     VideoSource out;
     std::string name = nameIn;
@@ -196,6 +209,18 @@ VideoSource findVideo(const scene::Files& files, const std::string& nameIn, cons
         out.playable = dest;
         return out;
     }
+    // A previous run may have died after ffmpeg finished but before the
+    // rename: a leftover .part that still probes as MPEG is the finished
+    // conversion - adopt it instead of encoding the whole video again.
+    const std::string part = dest + ".part";
+    if (fs::exists(toPath(part), ec) && probeMpeg(part)) {
+        std::error_code e2;
+        fs::rename(toPath(part), toPath(dest), e2);
+        if (!e2) {
+            out.playable = dest;
+            return out;
+        }
+    }
     const std::string ffmpeg = findFfmpeg(baseDir);
     if (ffmpeg.empty()) {
         out.error = "video " + nameIn + " needs ffmpeg to play (install it or put ffmpeg next to the game)";
@@ -224,6 +249,43 @@ VideoSource findVideo(const scene::Files& files, const std::string& nameIn, cons
     }).detach();
     out.converting = true;
     return out;
+}
+
+std::string ensurePlayableVideo(const std::string& path, const std::string& userDir,
+                                std::string& err) {
+    err.clear();
+    if (path.empty()) { err = "no video path"; return {}; }
+    for (const char* ext : {".mpg", ".mpeg"})
+        if (endsWithI(path, ext)) return path;
+    std::error_code ec;
+    if (!fs::exists(toPath(path), ec)) { err = "video not found: " + path; return {}; }
+    const auto size = fs::file_size(toPath(path), ec);
+    const long long mtime =
+        (long long)fs::last_write_time(toPath(path), ec).time_since_epoch().count();
+    const size_t key = std::hash<std::string>{}(path + "|" +
+        std::to_string((unsigned long long)size) + "|" + std::to_string(mtime));
+    char hex[32];
+    std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long)key);
+    const fs::path cacheDir = toPath(userDir) / "cache" / "videos";
+    const std::string dest = pathStr(cacheDir / (std::string(hex) + ".mpg"));
+    if (fs::exists(toPath(dest), ec)) return dest;
+    const std::string ffmpeg = findFfmpeg(userDir);
+    if (ffmpeg.empty()) {
+        err = "video needs ffmpeg to play (install it or put ffmpeg next to the game)";
+        return {};
+    }
+    fs::create_directories(cacheDir, ec);
+    const std::string part = dest + ".part";
+    const int rc = runProcess(ffmpeg, {"-hide_banner", "-loglevel", "error", "-y", "-i", path,
+                                       "-vf", "scale='trunc(min(1280,iw)/2)*2':-2", "-r", "30",
+                                       "-c:v", "mpeg1video", "-q:v", "4", "-bf", "0",
+                                       "-c:a", "mp2", "-b:a", "192k", "-ar", "44100",
+                                       "-ac", "2", "-f", "mpeg", part});
+    bool ok = rc == 0 && fs::exists(toPath(part), ec) && fs::file_size(toPath(part), ec) > 0;
+    if (ok) fs::rename(toPath(part), toPath(dest), ec);
+    ok = ok && !ec;
+    if (!ok) { fs::remove(toPath(part), ec); err = "ffmpeg could not convert " + path; return {}; }
+    return dest;
 }
 
 }  // namespace gh

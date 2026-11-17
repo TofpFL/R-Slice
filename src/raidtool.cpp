@@ -196,6 +196,8 @@ const TourPage kTour[] = {
      "4. Watch the log pane; SAVE LOG exports everything to a .txt."},
     {"The actions",
      "CONVERT   chart.json / .flp / .fsc -> .raid\n"
+     "          the OPP / PLAYER fields take .rchr character packs to\n"
+     "          embed in the chart - leave them empty for default sprites\n"
      "VERIFY    decode the whole file and check integrity\n"
      "INFO      header stats: version, events, chunks, patterns\n"
      "UPGRADE   fix files stamped v1 that contain v2 ops\n"
@@ -266,7 +268,7 @@ static int run() {
     // stack frames on window close.
     static Log log;
     static Job job;
-    Input pathIn, argsIn;
+    Input pathIn, argsIn, oppIn, playerIn;
     Rectangle logRect{};
     float logScroll = 0;
     std::string lastStatus = "Ready.";
@@ -316,13 +318,25 @@ static int run() {
         const double frameT0 = GetTime();
         g_modal = tourActive;
         // ---- input focus ----
-        static Rectangle s_pathRect{}, s_argsRect{};
+        static Rectangle s_pathRect{}, s_argsRect{}, s_oppRect{}, s_playerRect{};
         if (!tourActive) {
-            if (CheckCollisionPointRec(GetMousePosition(), s_pathRect)) { pathIn.focused = true; argsIn.focused = false; }
-            else if (CheckCollisionPointRec(GetMousePosition(), s_argsRect)) { argsIn.focused = true; pathIn.focused = false; }
-            else if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) { pathIn.focused = argsIn.focused = false; }
+            const Vector2 mouse = GetMousePosition();
+            const Rectangle* rects[] = {&s_pathRect, &s_argsRect, &s_oppRect, &s_playerRect};
+            Input* ins[] = {&pathIn, &argsIn, &oppIn, &playerIn};
+            bool any = false;
+            for (int i = 0; i < 4; ++i) {
+                if (CheckCollisionPointRec(mouse, *rects[i])) {
+                    for (int j = 0; j < 4; ++j) ins[j]->focused = (i == j);
+                    any = true;
+                    break;
+                }
+            }
+            if (!any && IsMouseButtonPressed(MOUSE_LEFT_BUTTON))
+                for (int j = 0; j < 4; ++j) ins[j]->focused = false;
             if (pathIn.focused) pathIn.handle();
             if (argsIn.focused) argsIn.handle();
+            if (oppIn.focused) oppIn.handle();
+            if (playerIn.focused) playerIn.handle();
         }
 
         // ---- completion sfx ----
@@ -401,6 +415,40 @@ static int run() {
         }
         EndScissorMode();
 
+        // character pack row: opponent / player .rchr embedded into .raid on convert
+        const float half = (W - 40) / 2;
+        auto packField = [&](Rectangle r, Input& in, const char* tag, const char* hint) {
+            DrawRectangleRounded(r, 0.15f, 6, Color{20, 28, 44, 255});
+            DrawRectangleRoundedLinesEx(r, 0.15f, 6, 1.5f,
+                                        in.focused ? Color{120, 220, 255, 255} : Color{60, 80, 120, 255});
+            DrawTextEx(font, tag, {r.x + 8, r.y + 8}, 11, 1, Color{255, 200, 90, 255});
+            BeginScissorMode(int(r.x) + 40, int(r.y) + 2, int(r.width) - 48, int(r.height) - 4);
+            if (in.focused) {
+                DrawTextEx(font, (in.text + "|").c_str(), {r.x + 42, r.y + 7}, 14, 1, WHITE);
+            } else {
+                DrawTextEx(font, in.text.c_str(), {r.x + 42, r.y + 7}, 14, 1,
+                           in.text.empty() ? fade(Color{110, 130, 170, 255}, 1) : WHITE);
+                if (in.text.empty())
+                    DrawTextEx(font, hint, {r.x + 42, r.y + 7}, 14, 1, fade(Color{110, 130, 170, 255}, 1));
+            }
+            EndScissorMode();
+        };
+        s_oppRect = {20, 172, half - 118, 30};
+        packField(s_oppRect, oppIn, "OPP", "default sprites");
+        if (button({s_oppRect.x + s_oppRect.width + 6, 172, 104, 30}, "OPP .RCHR", nullptr, font,
+                   Color{90, 160, 255, 255}, sfx)) {
+            std::string f = raidtool::pickFile("Opponent character pack", "RAID Character\0*.rchr\0\0");
+            if (!f.empty()) { oppIn.text = f; oppIn.caret = int(f.size()); sfx.play(sfx.select); }
+        }
+        const float px = 20 + half + 8;
+        s_playerRect = {px, 172, half - 118, 30};
+        packField(s_playerRect, playerIn, "PLAYER", "default sprites");
+        if (button({s_playerRect.x + s_playerRect.width + 6, 172, 104, 30}, "PLR .RCHR", nullptr, font,
+                   Color{90, 160, 255, 255}, sfx)) {
+            std::string f = raidtool::pickFile("Player character pack", "RAID Character\0*.rchr\0\0");
+            if (!f.empty()) { playerIn.text = f; playerIn.caret = int(f.size()); sfx.play(sfx.select); }
+        }
+
         // action grid
         struct Act { const char* label; const char* sub; const char* cmd; Color col; };
         const Act acts[] = {
@@ -416,13 +464,18 @@ static int run() {
         const float bw = (W - 40 - 2 * 16) / 3, bh = 62;
         int ai = 0;
         for (const Act& a : acts) {
-            Rectangle r{20 + float(ai % 3) * (bw + 16), 178 + float(ai / 3) * (bh + 12), bw, bh};
+            Rectangle r{20 + float(ai % 3) * (bw + 16), 214 + float(ai / 3) * (bh + 12), bw, bh};
             if (button(r, a.label, a.sub, font, a.col, sfx)) {
                 std::string args;
                 const std::string p = quote(pathIn.text);
                 if (!std::strcmp(a.cmd, "convert")) {
                     if (isDir(pathIn.text)) { log.add("[tool] convert takes a single file, not a folder"); sfx.play(sfx.warning); }
-                    else args = "convert " + p + " " + quote(convertOut());
+                    else {
+                        args = "convert " + p + " " + quote(convertOut());
+                        // embedded character packs: blank = default sprites
+                        if (!oppIn.text.empty()) args += " --opponent-pack " + quote(oppIn.text);
+                        if (!playerIn.text.empty()) args += " --player-pack " + quote(playerIn.text);
+                    }
                 } else if (!std::strcmp(a.cmd, "window")) {
                     if (argsIn.text.empty()) { log.add("[tool] window needs EXTRA ARGS like: 0 30000"); sfx.play(sfx.warning); }
                     else args = "window " + p + " " + argsIn.text;
@@ -436,8 +489,8 @@ static int run() {
             ++ai;
         }
 
-        // log pane (below the 3-row action grid which ends at y=388)
-        logRect = {20.0f, 400.0f, W - 40.0f, float(GetScreenHeight()) - 434.0f};
+        // log pane (below the 3-row action grid which ends at y=424)
+        logRect = {20.0f, 436.0f, W - 40.0f, float(GetScreenHeight()) - 470.0f};
         DrawRectangleRounded(logRect, 0.04f, 6, Color{8, 11, 18, 255});
         DrawRectangleRoundedLinesEx(logRect, 0.04f, 6, 1.5f, Color{45, 60, 95, 255});
         // header strip: SAVE LOG button (this 30px zone is excluded from wheel scroll)

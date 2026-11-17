@@ -90,6 +90,15 @@ struct Info {
     double lengthMs = 0;
 };
 
+// An asset pack recorded in a .raid trailer (see the "embedded packs"
+// section at the bottom of this file for the layout).
+struct EmbeddedAsset {
+    std::string name;           // logical pack name (usually the .rchr name)
+    std::vector<char> data;     // raw file bytes, e.g. a complete .rchr
+    bool reference = false;     // true: external .rchr reference, not bytes
+    std::string refPath;        // reference target when reference == true
+};
+
 struct EncodeOptions {
     uint32_t chunkEvents = 8192;    // expanded events per chunk (decode granularity)
                                      // must be <= kMaxChunkExpand
@@ -119,8 +128,12 @@ bool writeRaid(const std::string& path, const std::vector<Event>& events,
 // chart, exactly like a materialized JSON chart, without ever building it.
 // Projects without a playlist arrangement lay their chart patterns end to
 // end. `song.flp#N` single-pattern mode stays on the Chart path instead.
+// `opponentName`/`playerName` optionally stamp the meta character names
+// (e.g. from embedded .rchr packs); empty keeps the defaults.
 bool writeRaidFlp(const std::string& path, const FlpProject& project,
-                  const EncodeOptions& opt, Info* statsOut, std::string& err);
+                  const EncodeOptions& opt, Info* statsOut, std::string& err,
+                  std::string_view opponentName = {},
+                  std::string_view playerName = {});
 
 // ---------------------------------------------------------------- reader --
 
@@ -160,6 +173,11 @@ public:
     // The meta JSON (without its crc trailer), or "" when absent/corrupt.
     std::string metaJson();
 
+    // Embedded asset packs from the file's trailer (empty when absent).
+    // The trailer CRC is verified; a corrupt trailer is an error, not
+    // silently ignored data.
+    bool embeddedAssets(std::vector<EmbeddedAsset>& out, std::string& err);
+
     // Index of the last chunk whose firstTimeUs <= timeUs (-1 before the
     // first chunk).
     int64_t chunkAtOrBefore(int64_t timeUs) const;
@@ -176,6 +194,16 @@ public:
     // streaming consumers keep stable ids without materializing the chart.
     bool range(int64_t startUs, int64_t endUs, std::vector<Event>& out,
                std::string& err, std::vector<uint64_t>* indices = nullptr);
+
+    // Window-sliced variant of range(): identical events and global indices,
+    // but cache misses decode only the requested window instead of the
+    // whole chunk (repeat arithmetic + window clipping inside the op
+    // interpreter). Slices are not inserted into the chunk LRU, so repeated
+    // windows over the same chunk re-slice; use for benchmarking and for
+    // access patterns where whole-chunk decode is wasteful. range() remains
+    // the reference implementation.
+    bool rangeWindow(int64_t startUs, int64_t endUs, std::vector<Event>& out,
+                     std::vector<uint64_t>& indices, std::string& err);
 
     // One stretch of a chunk's op stream, in playback order. Only LEAF
     // ops produce segments: literal runs always, and pattern instances
@@ -209,6 +237,16 @@ public:
     // range()/chunkEvents() and to destroy the Reader while the future is
     // outstanding (the worker keeps the file state alive until it finishes).
     std::future<bool> chunkEventsAsync(size_t i, std::vector<Event>* out);
+    // Prefetch variant: decodes chunk i into the LRU cache only, with no
+    // event copy out. Cheaper and half the memory of chunkEventsAsync for
+    // callers that only need the cache warm.
+    std::future<bool> warmChunkAsync(size_t i);
+    // Batch variant: warms chunks [first, last) inside ONE worker thread.
+    // Spawning a std::async per chunk costs ~0.1 ms of thread creation
+    // each — a dense prefetch window is hundreds of chunks, which used to
+    // monopolize a frame. Batches keep worker parallelism without the
+    // thread-storm.
+    std::future<bool> warmChunksAsync(size_t first, size_t last);
 
     // Bounds for concurrent/async decoding. At most `n` chunk decodes run at
     // once across all threads (default 2); `bytes` caps the events a single
@@ -220,6 +258,16 @@ public:
     void setMaxConcurrentDecodes(int n);
     void setMemoryBudgetBytes(uint64_t bytes);
     uint64_t memoryBudgetBytes() const;
+    // Resident decoded events in the chunk LRU cache and its capacity
+    // (memory-budget derived). For playback memory statistics.
+    uint64_t cachedEvents() const;
+    uint64_t cachedEventCapacity() const;
+    // Chunk-cache instrumentation for density benchmarking: cumulative
+    // chunk queries that hit/missed the LRU, actual chunk decodes, and
+    // raw payload bytes read for decode. Hit rate exposes when chunk size
+    // or access pattern works against the cache.
+    void cacheStats(uint64_t& hits, uint64_t& misses,
+                    uint64_t& decodes, uint64_t& bytesDecoded) const;
 
     // Unique notes stored in the pattern table: events physically present in
     // pattern defs (each stored once, never expanded), stack-weighted for
@@ -329,5 +377,32 @@ uint32_t chunkPayloadVersion(const std::vector<char>& payload);
 
 // Quick magic check without parsing the index.
 bool isRaidFile(const std::string& path);
+
+// ------------------------------------------------------- embedded packs --
+//
+// A .raid file may carry embedded asset packs — typically .rchr character
+// archives — in an optional trailer appended after the last chunk:
+//
+//   [assets]  v1 (footer reserved = 0): u32 packCount, then per pack:
+//             u32 nameLen + name bytes + u64 dataSize + raw data bytes
+//   [assets]  v2 (footer reserved = 1): u32 packCount, then per pack:
+//             u8 type (0 = embedded, 1 = reference) + u32 nameLen + name +
+//             u64 size + payload. Embedded payload = raw file bytes;
+//             reference payload = UTF-8 path to an external .rchr.
+//   [footer]  24 bytes at EOF: magic "RAIDASST" (8), u64 assetsOffset,
+//             u32 crc32 of the assets blob, u32 reserved (= blob version)
+//
+// The trailer sits past every section the header/index describe, so readers
+// that predate it simply never look there — no version bump is needed and
+// old builds still play the chart (with default sprites). New readers find
+// the footer by reading the last 24 bytes. v2 records are not understood by
+// pre-v2 readers: they fail the trailer parse and skip the packs, which
+// degrades to default sprites rather than breaking the chart.
+
+// Appends the assets trailer to an existing .raid file, replacing any
+// trailer already present. `assets` may be empty to strip a trailer.
+// Fails when `path` is not a raid file.
+bool embedAssets(const std::string& path,
+                 const std::vector<EmbeddedAsset>& assets, std::string& err);
 
 }  // namespace gh::raid

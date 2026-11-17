@@ -40,6 +40,9 @@ struct Modifiers {
     // 1 that times scrollValue, 2 scrollValue whatever the chart says.
     int scrollType = 0;
     double scrollValue = 1.0;
+    // Freeplay modifier: draw a looping video from the song mod's videos/
+    // folder behind the stage instead of the procedural backdrop.
+    bool videoBg = false;
     // .raid charts only: log which encoded pattern plays when, to
     // <userDir>/raid_pattern_log.txt (see raid::PatternLogger).
     bool patternLog = false;
@@ -128,6 +131,11 @@ public:
     float effectiveVolume() const { return settings.muted ? 0.0f : settings.masterVol; }
     void saveSettings();
     void toggleFullscreen();
+    // Active monitor's refresh rate (Hz), re-polled ~1x/sec and on
+    // resize/fullscreen so multi-monitor and mode changes are picked up.
+    // 0 until first poll. Used by the FPS counter and available to pacing.
+    int monitorHz() const { return monitorHz_; }
+    void pollMonitorRefresh();
     // Loads (or drops) the "Psych Engine" interface from settings: textures,
     // sounds and menu music. `psychReport` says what was found.
     void applyPsychUi();
@@ -137,6 +145,9 @@ public:
     // first (fonts, health bar, notes, ratings, sounds); {} goes back.
     void psychUiForSong(const std::vector<std::string>& modRoots);
     bool psychAutomatic = false;   // no folder chosen: the best copy found on disk
+
+    // --vchart <song> [diff] --video <file>: video-backed chart visual mode.
+    std::string vchartSong, vchartDiff, vchartVideo;
 
     // Rendering mode (render_mode.hpp): the song being played is recorded to a
     // video. While it records, the game's time moves one video frame per loop.
@@ -155,6 +166,10 @@ public:
     // Deaths on the song played last (Psych's "Blueballed" in the pause menu).
     int blueballed = 0;
     std::string blueballedSong;
+
+    // Frame-time ring for diagnostics (PlayState F3 overlay percentiles).
+    const std::array<float, 240>& frameHist() const { return frameHist_; }
+    size_t frameHistPos() const { return frameHistPos_; }
 
 private:
     void frame();
@@ -177,6 +192,8 @@ private:
     unsigned long long memNow_ = 0, memPeak_ = 0, sysUsed_ = 0;
     std::array<float, 240> frameHist_{};  // the last frames' times (ms), for the graph
     size_t frameHistPos_ = 0;
+    int monitorHz_ = 0;
+    double monitorPollAt_ = 0;
     int perfFrames_ = 0;
     float perfUpd_ = 0, perfDraw_ = 0, perfWorst_ = 0;
     std::unique_ptr<State> state_, next_;
@@ -204,6 +221,8 @@ std::unique_ptr<State> makeOptions();
 std::unique_ptr<State> makeCredits();
 std::unique_ptr<State> makeCalibration();
 std::unique_ptr<State> makePlay(const PlayRequest& req);
+std::unique_ptr<State> makeVChart(const std::string& songId, const std::string& diff,
+                                  const std::string& videoPath);
 std::unique_ptr<State> makeResults(const ResultData& r);
 std::unique_ptr<State> makeChartEditor(const std::string& songId, const std::string& diff);
 std::unique_ptr<State> makeModPacks();

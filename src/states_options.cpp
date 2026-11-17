@@ -67,7 +67,7 @@ public:
             {Row::Bool, "Fullscreen", "Borderless fullscreen (F11 works anywhere).", &s.fullscreen},
             {Row::Bool, "VSync", "Waits for the screen's refresh. OFF: the frame limit below decides (most precise input).", &s.vsync},
             {Row::Choice, "Frame limit", "Higher limits make notes smoother. Input is polled at ~1000 Hz regardless.",
-             nullptr, nullptr, 0, 0, 0, &s.fpsCap, {60, 120, 144, 165, 240, 360, 500, 0}},
+             nullptr, nullptr, 0, 0, 0, &s.fpsCap, {60, 75, 120, 144, 165, 240, 360, 500, 0}},
             {Row::Bool, "Show FPS", "The frame rate at the top left.", &s.showFps},
             {Row::Bool, "FPS: memory", "Under the frame rate: the memory the game uses, and the most it has used.", &s.fpsMemory},
             {Row::Bool, "FPS: frame times", "How long updating and drawing take, the slowest frame of the last second, and a graph.",

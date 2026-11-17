@@ -13,11 +13,11 @@ cmake --build build_game --config Release
 "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe" build_game\RAIDEngine.sln /p:Configuration=Release /p:Platform=x64 /m
 ```
 
-Output: `build_game/Release/raide.exe` (game) and `raid_engine.exe` (CLI).
+Output: `build_game/Release/R-Slice.exe` (game) and `raid_engine.exe` (CLI).
 
 ## GCC (MinGW-w64)
 
-Verified end-to-end (WinLibs GCC 16.2, UCRT, CMake + Ninja): `raide.exe`,
+Verified end-to-end (WinLibs GCC 16.2, UCRT, CMake + Ninja): `R-Slice.exe`,
 `raid_engine.exe`, and `gh_tests.exe` (6889 tests, 0 failures) all build
 and run. raylib compiles cleanly under MinGW.
 
@@ -51,7 +51,7 @@ unverified end-to-end.
 ## Runtime DLLs on Windows
 
 - **MSVC**: binaries need the Visual C++ Redistributable (same as any
-  MSVC app); `raide.exe`/`raid_engine.exe` built here are fine on machines
+  MSVC app); `R-Slice.exe`/`raid_engine.exe` built here are fine on machines
   with the redist installed.
 - **GCC (MinGW-w64)**: links `libstdc++-6.dll`, `libgcc_s_seh-1.dll`,
   `libwinpthread-1.dll` unless statically linked. For a shippable

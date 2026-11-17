@@ -8,8 +8,11 @@
 //   raid_engine patterns <file.raid> [startMs] [endMs] op-stream log: which
 //                                                    pattern plays when
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <cstdio>
@@ -18,6 +21,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "chart.hpp"
@@ -27,14 +31,137 @@
 #include "raid.hpp"
 #include "raid_chart.hpp"
 #include "raid_doc.hpp"
+#include "session.hpp"
 #include "rchr.hpp"
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#elif defined(__linux__)
+#include <sys/resource.h>
+#endif
+
+namespace {
+// Peak resident set size in bytes — the honest "how much RAM did this
+// actually use" number for memory benchmarks (0 when unsupported).
+uint64_t peakRssBytes() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                             sizeof(pmc)))
+        return pmc.PeakWorkingSetSize;
+    return 0;
+#elif defined(__linux__)
+    struct rusage ru{};
+    if (getrusage(RUSAGE_SELF, &ru) == 0) return uint64_t(ru.ru_maxrss) * 1024;
+    return 0;
+#else
+    return 0;
+#endif
+}
+uint64_t curRssBytes() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                             sizeof(pmc)))
+        return pmc.WorkingSetSize;
+    return 0;
+#elif defined(__linux__)
+    return 0;  // Linux has no cheap current-RSS without /proc parsing
+#else
+    return 0;
+#endif
+}
+}  // namespace
 
 using namespace gh;
 
-static int convert(const std::string& in, const std::string& out) {
+// Character name a .rchr pack provides: the stem of its first
+// characters/<name>.json (or data/characters/<name>.json) entry.
+static std::string packCharName(const std::string& rchrPath, std::string& err) {
+    std::vector<rchr::Entry> ents;
+    if (!rchr::list(rchrPath, ents, err)) return "";
+    for (const rchr::Entry& e : ents) {
+        std::string lp = e.path;
+        for (char& ch : lp) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        static const char* kPrefixes[] = {"characters/", "data/characters/"};
+        for (const char* pre : kPrefixes) {
+            const size_t pl = std::strlen(pre);
+            if (lp.rfind(pre, 0) == 0 && lp.size() > pl + 5 &&
+                lp.compare(lp.size() - 5, 5, ".json") == 0) {
+                return e.path.substr(pl, e.path.size() - pl - 5);
+            }
+        }
+    }
+    return "";
+}
+
+static bool readBinaryFile(const std::string& path, std::vector<char>& out) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (n < 0) { std::fclose(f); return false; }
+    out.resize(size_t(n));
+    const bool ok = n == 0 || std::fread(out.data(), 1, size_t(n), f) == size_t(n);
+    std::fclose(f);
+    return ok;
+}
+
+struct PackPick {
+    std::string file;   // .rchr path given on the command line
+    std::string name;   // explicit --*-name override, "" = derive from pack
+    bool embedBytes = false;  // --*-pack-embed: store bytes, not a reference
+};
+
+static int convert(const std::string& in, const std::string& out,
+                   const PackPick& opp, const PackPick& player) {
     raid::EncodeOptions opt;
     raid::Info info;
     std::string err;
+
+    // Resolve the packs up front: --*-pack records an external .rchr
+    // reference in the trailer; --*-pack-embed reads the bytes for
+    // embedding. Either way the character name is derived for the meta.
+    std::vector<raid::EmbeddedAsset> packs;
+    std::string oppName = opp.name, playerName = player.name;
+    auto loadPack = [&](const PackPick& pk, raid::EmbeddedAsset& dst,
+                        std::string& charName) -> bool {
+        if (pk.file.empty()) return true;
+        dst.name = pk.file;
+        const size_t slash = dst.name.find_last_of("/\\");
+        if (slash != std::string::npos) dst.name = dst.name.substr(slash + 1);
+        if (pk.embedBytes) {
+            if (!readBinaryFile(pk.file, dst.data)) {
+                std::printf("pack load failed: %s\n", pk.file.c_str());
+                return false;
+            }
+        } else {
+            dst.reference = true;
+            dst.refPath = pk.file;
+            for (char& ch : dst.refPath) if (ch == '\\') ch = '/';
+        }
+        packs.push_back(dst);
+        if (charName.empty()) {
+            charName = packCharName(pk.file, err);
+            if (charName.empty())
+                std::printf("  note: %s has no characters/*.json — meta name unchanged\n",
+                            pk.file.c_str());
+        }
+        return true;
+    };
+    raid::EmbeddedAsset oppPack, playerPack;
+    if (!loadPack(opp, oppPack, oppName) || !loadPack(player, playerPack, playerName))
+        return 1;
 
     // Whole .flp/.fsc projects encode directly: patterns are stored once as
     // pattern-table definitions and playlist clips place them on the
@@ -42,26 +169,37 @@ static int convert(const std::string& in, const std::string& out) {
     // still selects a single pattern through the Chart path.
     std::string flpFile;
     int flpPat = -1;
+    bool ok;
     if (flpChartPath(in, flpFile, flpPat) && flpPat < 0) {
         FlpProject p;
+        const auto tp0 = std::chrono::steady_clock::now();
         if (!readFlpFile(flpFile, p, err)) {
             std::printf("load failed: %s\n", err.c_str());
             return 1;
         }
-        if (!raid::writeRaidFlp(out, p, opt, &info, err)) {
-            std::printf("encode failed: %s\n", err.c_str());
-            return 1;
-        }
+        std::fprintf(stderr, "[flp] parsed %zu patterns, %zu playlist items in %.1f s\n",
+                     p.patterns.size(), p.playlist.size(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count());
+        const auto tp1 = std::chrono::steady_clock::now();
+        ok = raid::writeRaidFlp(out, p, opt, &info, err, oppName, playerName);
+        std::fprintf(stderr, "[flp] encoded in %.1f s\n",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - tp1).count());
+        if (!ok) std::printf("encode failed: %s\n", err.c_str());
     } else {
         Chart c;
         if (!loadChartFile(in, "", c, err)) {
             std::printf("load failed: %s\n", err.c_str());
             return 1;
         }
-        if (!raid::saveChart(out, c, opt, &info, err)) {
-            std::printf("encode failed: %s\n", err.c_str());
-            return 1;
-        }
+        if (!oppName.empty()) c.opponent = oppName;
+        if (!playerName.empty()) c.player = playerName;
+        ok = raid::saveChart(out, c, opt, &info, err);
+        if (!ok) std::printf("encode failed: %s\n", err.c_str());
+    }
+    if (!ok) return 1;
+    if (!packs.empty() && !raid::embedAssets(out, packs, err)) {
+        std::printf("pack embed failed: %s\n", err.c_str());
+        return 1;
     }
     std::printf("%s -> %s\n", in.c_str(), out.c_str());
     std::printf("  logical events : %llu\n", (unsigned long long)info.logicalEvents);
@@ -74,6 +212,11 @@ static int convert(const std::string& in, const std::string& out) {
     std::printf("  payload bytes  : %llu raw -> %llu stored (%.2fx)\n",
                 (unsigned long long)info.rawBytes, (unsigned long long)info.storedBytes,
                 info.storedBytes ? double(info.rawBytes) / double(info.storedBytes) : 0.0);
+    if (!oppName.empty()) std::printf("  opponent char  : %s\n", oppName.c_str());
+    if (!playerName.empty()) std::printf("  player char    : %s\n", playerName.c_str());
+    for (const raid::EmbeddedAsset& p : packs)
+        std::printf("  %s: %s (%s)\n", p.reference ? "pack ref" : "embedded pack",
+                    p.name.c_str(), p.reference ? p.refPath.c_str() : "");
     return 0;
 }
 
@@ -95,6 +238,14 @@ static int info(const std::string& path) {
         if (rd.uniqueStats(uev, un, err))
             std::printf("  unique notes   : %llu in %llu stored events (pattern table)\n",
                         (unsigned long long)un, (unsigned long long)uev);
+    }
+    {
+        std::vector<raid::EmbeddedAsset> packs;
+        if (rd.embeddedAssets(packs, err)) {
+            for (const raid::EmbeddedAsset& p : packs)
+                std::printf("  %s  : %s (%s)\n", p.reference ? "pack ref" : "embedded pack",
+                            p.name.c_str(), p.reference ? p.refPath.c_str() : "");
+        }
     }
     std::printf("  duration       : %.0f ms\n", double(rd.durationUs()) / 1000.0);
     rd.close();
@@ -152,9 +303,9 @@ static int window(const std::string& path, const char* a, const char* b) {
     std::printf("%lld events in [%.0f, %.0f) ms\n", (long long)evs.size(),
                 double(lo) / 1000.0, double(hi) / 1000.0);
     for (const raid::Event& e : evs)
-        std::printf("  t=%lld.%03d ms lane=%u side=%u kind=%u len=%lld us\n",
+        std::printf("  t=%lld.%03d ms lane=%u side=%u kind=%u pitch=%d len=%lld us type=%u stack=%u\n",
                     (long long)(e.timeUs / 1000), int(e.timeUs % 1000), e.lane, e.side, e.kind,
-                    (long long)e.lengthUs);
+                    e.pitch, (long long)e.lengthUs, e.type, e.stack);
     rd.close();
     return 0;
 }
@@ -260,10 +411,358 @@ static int streamtest(const std::string& path) {
     cs.close();
     std::printf("fed %llu events, %llu stacked notes (%llu out-of-range lanes)\n",
                 (unsigned long long)total, (unsigned long long)stackSum, (unsigned long long)badLane);
+    std::printf("peak RSS %.1f MB, RSS at close %.1f MB\n",
+                peakRssBytes() / 1048576.0, curRssBytes() / 1048576.0);
     for (size_t i = 0; i < bucket.size(); ++i)
         if (bucket[i]) std::printf("  %4zu0-%4zus: %llu\n", i, i, (unsigned long long)bucket[i]);
     return 0;
 }
+// slicebench: A/B the reference decoder (Reader::range, whole-chunk decode
+// + LRU) against window-sliced decode (Reader::rangeWindow) through the
+// same 60 Hz / 4 s-lookahead feed loop the game uses.
+static int slicebench(const std::string& path) {
+    raid::Reader probe;
+    std::string err;
+    if (!probe.open(path, err)) { std::printf("open failed: %s\n", err.c_str()); return 1; }
+    const double lengthMs = double(probe.durationUs()) / 1000.0;
+    const uint64_t logical = probe.info().logicalEvents;
+    probe.close();
+
+    for (int mode = 0; mode < 2; ++mode) {
+        raid::Reader rd;
+        if (!rd.open(path, err)) { std::printf("open failed: %s\n", err.c_str()); return 1; }
+        int64_t fedUs = std::numeric_limits<int64_t>::min() / 4;
+        double songMs = -300.0;
+        const double stepMs = 1000.0 / 60.0;
+        uint64_t total = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (songMs < lengthMs + 5000.0) {
+            songMs += stepMs;
+            const int64_t endUs = int64_t(std::max(0.0, songMs + 4000.0) * 1000.0);
+            if (endUs > fedUs) {
+                std::vector<raid::Event> evs;
+                std::vector<uint64_t> idx;
+                bool ok = mode == 0
+                    ? rd.range(fedUs, endUs, evs, err, &idx)
+                    : rd.rangeWindow(fedUs, endUs, evs, idx, err);
+                if (!ok) { std::printf("decode failed: %s\n", err.c_str()); return 1; }
+                total += evs.size();
+                fedUs = endUs;
+            }
+        }
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("%-12s %10.1f s  %12llu events  %8.2fM ev/s  peakRSS %.1f MB\n",
+                    mode == 0 ? "range" : "rangeWindow", secs,
+                    (unsigned long long)total, total / secs / 1e6,
+                    peakRssBytes() / 1048576.0);
+        rd.close();
+    }
+    std::printf("%s: %llu logical events, %.0f ms\n", path.c_str(),
+                (unsigned long long)logical, lengthMs);
+    return 0;
+}
+
+// densgen: synthetic density chart for playback scaling tests.
+//   raid_engine densgen <out.raid> <seconds> <eventsPerSec> <chunkEvents>
+//                       [sustainEvery] [overlapEvery] [keys]
+// Notes are periodic (period 2*keys) so the encoder's pattern matcher
+// collapses them into repeated pattern instances — the file stays small
+// while decode expands the full physical count. overlapEvery>0 adds a
+// simultaneous note on the mirrored lane every Nth step.
+static int densgen(int argc, char** argv) {
+    if (argc < 6) {
+        std::printf("usage: raid_engine densgen <out.raid> <seconds> <evPerSec> <chunkEvents> [sustainEvery] [overlapEvery] [keys]\n");
+        return 1;
+    }
+    const std::string out = argv[2];
+    const double seconds = std::atof(argv[3]);
+    const double eps = std::atof(argv[4]);
+    const uint32_t chunkEvents = uint32_t(std::strtoul(argv[5], nullptr, 10));
+    const int sustainEvery = argc > 6 ? std::atoi(argv[6]) : 32;
+    const int overlapEvery = argc > 7 ? std::atoi(argv[7]) : 0;
+    const int keys = argc > 8 ? std::atoi(argv[8]) : 4;
+    const uint64_t n = uint64_t(seconds * eps);
+    if (n == 0 || n > 25000000ull) {
+        std::printf("event count %llu out of range (max 25M — RAM bound)\n",
+                    (unsigned long long)n);
+        return 1;
+    }
+    // Build raw raid::Events, NOT a Chart: Chart::finalize merges same
+    // side+lane notes within 1 ms into stacks, which would cap physical
+    // density at ~2*keys notes/ms. The density test needs the true
+    // physical event rate, so it bypasses the Chart path entirely.
+    std::vector<raid::Event> evs;
+    evs.reserve(size_t(n) + (overlapEvery ? n / overlapEvery : 0));
+    const int64_t stepUs = std::max<int64_t>(1, int64_t(1000000.0 / eps));
+    uint64_t playerN = 0, oppN = 0;
+    for (uint64_t i = 0; i < n; ++i) {
+        raid::Event e;
+        e.timeUs = int64_t(i) * stepUs;
+        e.lengthUs = (sustainEvery > 0 && i % uint64_t(sustainEvery) == 0)
+                         ? uint32_t(500000) : 0;
+        e.lane = uint8_t(i % uint64_t(keys));
+        e.side = uint8_t((i / uint64_t(keys)) % 2);
+        e.kind = 0;
+        e.stack = uint16_t(i % 251 == 0 ? 32 : 1);
+        evs.push_back(e);
+        (e.side ? playerN : oppN) += e.stack;
+        if (overlapEvery > 0 && i % uint64_t(overlapEvery) == 0) {
+            raid::Event o = e;
+            o.lane = uint8_t((e.lane + 1) % keys);
+            o.side ^= 1;
+            evs.push_back(o);
+            (o.side ? playerN : oppN) += o.stack;
+        }
+    }
+    // Meta-only Chart for the header JSON (keys/tempo/totals; notes empty).
+    Chart meta;
+    meta.title = "density";
+    meta.difficulty = "Dense";
+    meta.keys = keys;
+    meta.tempo.push_back({0, 120});
+    meta.playerNotes = playerN;
+    meta.opponentNotes = oppN;
+    meta.lengthMs = double(evs.back().timeUs + evs.back().lengthUs) / 1000.0;
+    raid::EncodeOptions opt;
+    opt.chunkEvents = chunkEvents;
+    raid::Info info;
+    std::string err;
+    if (!raid::writeRaid(out, evs, raid::chartMetaJson(meta), opt, &info, err)) {
+        std::printf("encode failed: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("%s: %llu logical events, %llu chunks, %llu patterns, %.1f MB file\n",
+                out.c_str(), (unsigned long long)info.logicalEvents,
+                (unsigned long long)info.chunkCount, (unsigned long long)info.patternCount,
+                double(std::filesystem::file_size(out)) / 1048576.0);
+    return 0;
+}
+
+// densbench: full gameplay-path benchmark — ChartStream + PlaybackFeed +
+// Session at the game's 60 Hz cadence with judgement updates. Reports feed
+// throughput, per-frame pump/update times, Session lane-note residency,
+// chunk-cache hit rate and bytes decoded per playback second.
+static int densbench(const std::string& path, bool realtime, uint64_t memBudgetMb = 0) {
+    raid::ChartStream cs;
+    Chart meta;
+    std::string err;
+    if (!cs.open(path, meta, err)) { std::printf("open failed: %s\n", err.c_str()); return 1; }
+    Session session;
+    SessionConfig cfg;
+    cfg.botplay = true;   // auto-judge: exercises hit/miss path + lets GC run
+    session.init(meta, cfg);
+    session.setTotals(meta.playerNotes, meta.opponentNotes);
+    raid::PlaybackFeed feed;
+    feed.bind(cs);
+    feed.setMaxConcurrentDecodes(std::max(2, std::min(8, int(std::thread::hardware_concurrency()))));
+    if (memBudgetMb) feed.setMemoryBudgetBytes(memBudgetMb << 20);
+
+    const double lengthMs = cs.lengthMs();
+    const double stepMs = 1000.0 / 60.0;
+    uint64_t peakLaneNotes = 0, laneNoteSum = 0, laneSamples = 0;
+    double pumpSum = 0, updSum = 0, pumpMax = 0;
+    std::vector<double> pumpTimes, updTimes, convTimes, gcTimes, frameTimes;
+    pumpTimes.reserve(size_t(lengthMs / stepMs) + 16);
+    updTimes.reserve(pumpTimes.capacity()); convTimes.reserve(pumpTimes.capacity());
+    gcTimes.reserve(pumpTimes.capacity()); frameTimes.reserve(pumpTimes.capacity());
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto frame0 = t0;
+    for (double songMs = 0.0; songMs <= lengthMs; songMs += stepMs) {
+        const auto f0 = std::chrono::steady_clock::now();
+        if (!feed.advance(songMs, session, meta.keys, false, err)) {
+            std::printf("feed failed @ %.0f ms: %s\n", songMs, err.c_str());
+            return 1;
+        }
+        const auto f1 = std::chrono::steady_clock::now();
+        session.update(songMs);
+        const auto f2 = std::chrono::steady_clock::now();
+        // The game drains GameEvents every frame; do the same so `events`
+        // doesn't grow unboundedly and skew the residency numbers.
+        session.events.clear();
+        const double pumpMs = std::chrono::duration<double, std::milli>(f1 - f0).count();
+        const double updMs = std::chrono::duration<double, std::milli>(f2 - f1).count();
+        pumpSum += pumpMs; updSum += updMs;
+        pumpMax = std::max(pumpMax, pumpMs);
+        pumpTimes.push_back(pumpMs);
+        updTimes.push_back(updMs);
+        convTimes.push_back(feed.lastConvertMs());
+        gcTimes.push_back(feed.lastGcMs());
+        frameTimes.push_back(std::chrono::duration<double, std::milli>(f2 - f0).count());
+        size_t lanes = 0;
+        for (int side = 0; side < 2; ++side)
+            for (int l = 0; l < meta.keys; ++l) lanes += session.lane(side, l).size();
+        peakLaneNotes = std::max<uint64_t>(peakLaneNotes, lanes);
+        laneNoteSum += lanes;
+        ++laneSamples;
+        if (realtime) {
+            // Pace to a real 60 Hz frame: sleep until 16.667 ms after the
+            // previous frame boundary so prefetch workers get real time —
+            // this isolates intrinsic pump cost from decode-keepup lag.
+            const auto frameStart = frame0 +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(songMs / 1000.0));
+            const auto deadline = frameStart + std::chrono::microseconds(16667);
+            const auto now = std::chrono::steady_clock::now();
+            if (now < deadline) std::this_thread::sleep_until(deadline);
+        }
+    }
+    uint64_t ch = 0, cm = 0, cd = 0, cbd = 0;
+    cs.reader().cacheStats(ch, cm, cd, cbd);
+    const uint64_t cachedEv = cs.cachedEvents(), cachedCap = cs.cachedEventCapacity();
+    cs.close();
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    auto pct = [](std::vector<double> v, double q) {
+        std::sort(v.begin(), v.end());
+        return v[size_t(v.size() * q)];
+    };
+    const double p50 = pct(pumpTimes, 0.5);
+    const double p99 = pct(pumpTimes, 0.99);
+    const double p999 = pct(pumpTimes, 0.999);
+
+    const uint64_t queries = ch + cm;
+    std::printf("%s: %.0f ms chart, %.1f s bench%s\n", path.c_str(), lengthMs, secs,
+                realtime ? " (real-time paced)" : "");
+    std::printf("  fed %llu physical events -> %llu lane notes (%llu stack-weighted notes); %.2fM physical NPS, %.2fM stacked NPS over %.1f s\n",
+                (unsigned long long)feed.fedEvents(),
+                (unsigned long long)feed.appendedEvents(),
+                (unsigned long long)feed.fedStackedNotes(),
+                feed.fedEvents() / secs / 1e6, feed.fedStackedNotes() / secs / 1e6, secs);
+    std::printf("  pump ms: avg %.3f  p50 %.3f  p99 %.3f  p99.9 %.3f  max %.1f\n",
+                pumpSum / pumpTimes.size(), p50, p99, p999, pumpMax);
+    auto line = [](const char* name, const std::vector<double>& v) {
+        double sum = 0, mx = 0;
+        for (double x : v) { sum += x; mx = std::max(mx, x); }
+        std::vector<double> s = v;
+        std::sort(s.begin(), s.end());
+        std::printf("    %-9s avg %7.3f  p50 %7.3f  p99 %7.3f  p99.9 %7.3f  max %8.1f\n",
+                    name, sum / double(v.size()), s[s.size() / 2],
+                    s[size_t(s.size() * 0.99)], s[size_t(s.size() * 0.999)], mx);
+    };
+    line("convert", convTimes);
+    line("gc", gcTimes);
+    line("session", updTimes);
+    line("frame", frameTimes);
+    std::printf("  session.update ms avg %.3f\n", updSum / pumpTimes.size());
+    std::printf("  lane notes resident: peak %llu, avg %.0f (%.1f%% of peak-cap %.0f MB est)\n",
+                (unsigned long long)peakLaneNotes,
+                laneSamples ? double(laneNoteSum) / double(laneSamples) : 0.0,
+                100.0 * double(peakLaneNotes) / double(std::max<uint64_t>(1, cachedCap)),
+                double(cachedCap) * 32.0 / 1048576.0);
+    std::printf("  chunk cache: %llu hit / %llu miss (%.1f%% hit), %llu decodes, %.1f MB raw decoded (%.1f MB/s)\n",
+                (unsigned long long)ch, (unsigned long long)cm,
+                queries ? 100.0 * double(ch) / double(queries) : 0.0,
+                (unsigned long long)cd, double(cbd) / 1048576.0, cbd / secs / 1048576.0);
+    std::printf("  cache resident %llu/%llu events (%.1f MB / %.1f MB budget)\n",
+                (unsigned long long)cachedEv, (unsigned long long)cachedCap,
+                double(cachedEv) * 32.0 / 1048576.0,
+                double(cachedCap) * 32.0 / 1048576.0);
+    std::printf("  peak RSS %.1f MB, RSS at close %.1f MB\n",
+                peakRssBytes() / 1048576.0, curRssBytes() / 1048576.0);
+    return 0;
+}
+
+// bench: decode the whole chart through ChartStream::pump at 60 Hz pump
+// cadence (same pattern as gameplay) and report logical events/sec.
+static int bench(const std::string& path) {
+    raid::ChartStream cs;
+    Chart meta;
+    std::string err;
+    if (!cs.open(path, meta, err)) {
+        std::printf("open failed: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("%s: %.0f ms, keys %d, P%llu O%llu notes\n", path.c_str(), meta.lengthMs,
+                meta.keys, (unsigned long long)meta.playerNotes,
+                (unsigned long long)meta.opponentNotes);
+
+    // Warm-up: decode chunk 0 so pattern-blob load cost is excluded.
+    {
+        std::vector<raid::Event> w;
+        std::vector<uint64_t> wi;
+        cs.pump(0, 1000000, w, wi, err);
+    }
+
+    int64_t fedUs = std::numeric_limits<int64_t>::min() / 4, prefetchUs = fedUs;
+    double songMs = -300.0;
+    const double stepMs = 1000.0 / 60.0;
+    uint64_t total = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (songMs < meta.lengthMs + 5000.0) {
+        songMs += stepMs;
+        const int64_t endUs = int64_t(std::max(0.0, songMs + 4000.0) * 1000.0);
+        if (endUs > fedUs) {
+            std::vector<raid::Event> evs;
+            std::vector<uint64_t> idx;
+            if (!cs.pump(fedUs, endUs, evs, idx, err)) {
+                std::printf("PUMP FAIL @ %.0f ms: %s\n", songMs, err.c_str());
+                return 1;
+            }
+            total += evs.size();
+            fedUs = endUs;
+        }
+        if (endUs >= prefetchUs) {
+            cs.prefetch(endUs, endUs + int64_t(16000.0 * 1000.0));
+            prefetchUs = endUs + int64_t(8000.0 * 1000.0);
+        }
+    }
+    cs.close();
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("decoded %llu events in %.3f s -> %.0f events/s (%.1fM NPS logical)\n",
+                (unsigned long long)total, sec, total / sec, total / sec / 1e6);
+    std::printf("peak RSS %.1f MB, RSS at close %.1f MB\n",
+                peakRssBytes() / 1048576.0, curRssBytes() / 1048576.0);
+    return 0;
+}
+
+// bench <file> <jobs>: decode the whole chart through Reader::range split
+// across `jobs` threads on disjoint time slices — measures parallel decode
+// scaling (inflate + pattern expansion). jobs<=1 keeps the ChartStream path.
+static int benchJobs(const std::string& path, int jobs) {
+    raid::Reader r;
+    std::string err;
+    if (!r.open(path, err)) {
+        std::printf("open failed: %s\n", err.c_str());
+        return 1;
+    }
+    const raid::Info info = r.info();
+    std::printf("%s: %.1f s, keys %u, %llu logical events, jobs %d\n", path.c_str(),
+                r.durationUs() / 1e6, info.keyCount,
+                (unsigned long long)info.logicalEvents, jobs);
+    r.setMaxConcurrentDecodes(jobs);
+    // Warm-up: pattern-blob load + first-chunk decode cost excluded.
+    {
+        std::vector<raid::Event> w;
+        std::vector<uint64_t> wi;
+        r.range(0, 1000000, w, err, &wi);
+    }
+    const int64_t totalUs = r.durationUs() + 2000000;
+    std::vector<std::thread> ths;
+    std::vector<uint64_t> counts(size_t(jobs), 0);
+    std::vector<std::string> rangeErrs = std::vector<std::string>(size_t(jobs));
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < jobs; ++i) {
+        const int64_t lo = totalUs * i / jobs;
+        const int64_t hi = totalUs * (i + 1) / jobs;
+        ths.emplace_back([&, i, lo, hi] {
+            std::vector<raid::Event> evs;
+            std::vector<uint64_t> idx;
+            if (!r.range(lo, hi, evs, rangeErrs[size_t(i)], &idx)) return;
+            counts[size_t(i)] = evs.size();
+        });
+    }
+    for (auto& t : ths) t.join();
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    uint64_t total = 0;
+    for (uint64_t c : counts) total += c;
+    for (const std::string& e : rangeErrs)
+        if (!e.empty()) { std::printf("range failed: %s\n", e.c_str()); return 1; }
+    std::printf("decoded %llu events in %.3f s -> %.0f events/s (%.1fM NPS logical)\n",
+                (unsigned long long)total, sec, total / sec, total / sec / 1e6);
+    std::printf("peak RSS %.1f MB, RSS at close %.1f MB\n",
+                peakRssBytes() / 1048576.0, curRssBytes() / 1048576.0);
+    return 0;
+}
+
 // ---- .rchr (RAID Character archives) ---------------------------------------
 
 namespace fs = std::filesystem;
@@ -934,23 +1433,61 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::printf("raid_engine - RAID Engine command line tool\n"
                     "  raid_engine convert <chart|flp|fsc> <out.raid>\n"
+                    "      [--opponent-pack f.rchr] [--player-pack f.rchr]\n"
+                    "      [--opponent-pack-embed f] [--player-pack-embed f]\n"
+                    "      [--opponent-name n] [--player-name n]\n"
                     "  raid_engine info <file.raid>\n"
                     "  raid_engine verify <file.raid>\n"
                     "  raid_engine window <file.raid> <startMs> <endMs>\n"
                     "  raid_engine meta <file.raid>\n"
                     "  raid_engine patterns <file.raid> [startMs] [endMs]\n"
                     "  raid_engine streamtest <file.raid>\n"
+                    "  raid_engine bench <file.raid> [jobs]\n"
+                    "  raid_engine slicebench <file.raid>\n"
+                    "  raid_engine densgen <out.raid> <sec> <evPerSec> <chunkEvents> [susEvery] [overlapEvery] [keys]\n"
+                    "  raid_engine densbench <file.raid>\n"
                     "  raid_engine rchr pack|list|unpack ...\n"
                     "  raid_engine upgrade <file|dir>...   re-stamp format version\n");
         return argc < 2 ? 2 : 1;
     }
     const std::string cmd = argv[1];
-    if (cmd == "convert" && argc >= 4) return convert(argv[2], argv[3]);
+    if (cmd == "convert" && argc >= 4) {
+        // Optional pack flags: --opponent-pack/--player-pack record an
+        // external .rchr reference in the .raid trailer (--*-pack-embed
+        // stores the bytes instead); --*-name overrides the character name.
+        PackPick opp, player;
+        if ((argc - 4) % 2 != 0) {
+            std::printf("convert flags must come in --flag value pairs\n");
+            return 2;
+        }
+        for (int i = 4; i + 1 < argc; i += 2) {
+            const std::string flag = argv[i];
+            PackPick* dst = nullptr;
+            if (flag == "--opponent-pack") dst = &opp;
+            else if (flag == "--player-pack") dst = &player;
+            else if (flag == "--opponent-pack-embed") { opp.embedBytes = true; dst = &opp; }
+            else if (flag == "--player-pack-embed") { player.embedBytes = true; dst = &player; }
+            else if (flag == "--opponent-name") { opp.name = argv[i + 1]; continue; }
+            else if (flag == "--player-name") { player.name = argv[i + 1]; continue; }
+            else { std::printf("unknown convert flag: %s\n", flag.c_str()); return 2; }
+            dst->file = argv[i + 1];
+        }
+        return convert(argv[2], argv[3], opp, player);
+    }
     if (cmd == "info" && argc >= 3) return info(argv[2]);
     if (cmd == "verify" && argc >= 3) return verify(argv[2]);
     if (cmd == "window" && argc >= 5) return window(argv[2], argv[3], argv[4]);
     if (cmd == "meta" && argc >= 3) return meta(argv[2]);
     if (cmd == "streamtest" && argc >= 3) return streamtest(argv[2]);
+    if (cmd == "slicebench" && argc >= 3) return slicebench(argv[2]);
+    if (cmd == "densgen" && argc >= 6) return densgen(argc, argv);
+    if (cmd == "densbench" && argc >= 3)
+        return densbench(argv[2], argc >= 4 && std::string(argv[3]) == "rt",
+                        argc >= 5 ? std::strtoull(argv[4], nullptr, 10) : 0);
+    if (cmd == "bench" && argc >= 3) {
+        const int jobs = argc >= 4 ? std::max(1, std::atoi(argv[3])) : 0;
+        return jobs >= 1 ? benchJobs(argv[2], jobs) : bench(argv[2]);
+    }
     if (cmd == "rchr" && argc >= 3) return rchrCmd(argc, argv);
     if (cmd == "patterns" && argc >= 3)
         return patterns(argv[2], argc >= 4 ? argv[3] : nullptr,

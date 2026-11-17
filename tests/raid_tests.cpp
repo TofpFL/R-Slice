@@ -15,6 +15,7 @@
 #include "chart.hpp"
 #include "chart_stream.hpp"
 #include "common.hpp"
+#include "flp_import.hpp"
 #include "raid.hpp"
 #include "raid_chart.hpp"
 #include "session.hpp"
@@ -788,6 +789,244 @@ void testSessionStreaming() {
     RCHECK(s.allResolved());
 }
 
+// PlaybackFeed: the PlayState coordinator. advance() must reproduce the
+// materialized-chart session exactly — same LaneNotes, same stable ids —
+// while owning cursors, lookahead and GC itself.
+void testPlaybackFeed() {
+    const std::string file = tmpPath("gh_raid_feed.raid");
+    Chart c;
+    c.title = "feed";
+    c.difficulty = "Normal";
+    c.keys = 4;
+    c.tempo.push_back({0, 120});
+    for (int i = 0; i < 3000; ++i) {
+        Note n;
+        n.time = 100.0 + i * 16.3;
+        n.length = (i % 6 == 0) ? 400.0 : 0.0;
+        n.lane = i % 4;
+        n.side = (i / 4) % 2;
+        n.kind = kNormal;
+        n.stack = uint16_t(1 + (i % 3 == 0 ? 1 : 0));
+        c.notes.push_back(n);
+    }
+    c.finalize(120);
+    raid::EncodeOptions opt;
+    raid::Info info;
+    std::string err;
+    RCHECK(raid::saveChart(file, c, opt, &info, err));
+
+    raid::ChartStream cs;
+    Chart meta;
+    RCHECK(cs.open(file, meta, err));
+
+    // Reference: session fed directly from materialized events.
+    Session ref;
+    SessionConfig cfg;
+    ref.init(meta, cfg);
+    const std::vector<raid::Event> evs = raid::chartEvents(c);
+    for (size_t i = 0; i < evs.size(); ++i) {
+        const raid::Event& e = evs[i];
+        LaneNote ln;
+        ln.t = double(e.timeUs) / 1000.0;
+        ln.len = double(e.lengthUs) / 1000.0;
+        ln.kind = e.kind;
+        ln.flags = e.flags;
+        ln.type = e.type;
+        ln.stack = std::max<uint16_t>(1, e.stack);
+        ln.id = uint32_t(i);
+        ref.appendLaneNote(int(e.side), int(e.lane), ln);
+    }
+
+    // Streamed: metadata chart + PlaybackFeed stepped like the playstate.
+    Session s;
+    s.init(meta, cfg);
+    s.setTotals(c.playerNotes, c.opponentNotes);
+    raid::PlaybackFeed feed;
+    RCHECK(!feed.isBound());
+    feed.bind(cs);
+    RCHECK(feed.isBound());
+    const double endMs = meta.lengthMs + 5000.0;
+    for (double ms = 0.0; ms <= endMs; ms += 250.0)
+        RCHECK(feed.advance(ms, s, meta.keys, false, err));
+    RCHECK(feed.fedEvents() == info.logicalEvents);
+    RCHECK(feed.appendedEvents() == info.logicalEvents);  // all lanes < keys
+
+    for (int side = 0; side < 2; ++side)
+        for (int l = 0; l < meta.keys; ++l) {
+            const auto& a = s.lane(side, l), &b = ref.lane(side, l);
+            RCHECK(a.size() == b.size());
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+                RCHECK(a[i].t == b[i].t && a[i].len == b[i].len && a[i].id == b[i].id &&
+                       a[i].kind == b[i].kind && a[i].type == b[i].type &&
+                       a[i].stack == b[i].stack);
+        }
+
+    // Mirror: sides flip, note data otherwise identical.
+    Session sm;
+    sm.init(meta, cfg);
+    raid::PlaybackFeed fm;
+    fm.bind(cs);
+    for (double ms = 0.0; ms <= endMs; ms += 500.0)
+        RCHECK(fm.advance(ms, sm, meta.keys, true, err));
+    for (int side = 0; side < 2; ++side)
+        for (int l = 0; l < meta.keys; ++l) {
+            const auto& a = sm.lane(side, l), &b = s.lane(side ^ 1, l);
+            RCHECK(a.size() == b.size());
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+                RCHECK(a[i].t == b[i].t && a[i].id == b[i].id);
+        }
+
+    // reset() re-feeds from the start (seek/restart path).
+    feed.reset();
+    RCHECK(feed.fedEvents() == 0 && feed.appendedEvents() == 0);
+    Session s2;
+    s2.init(meta, cfg);
+    RCHECK(feed.advance(0.0, s2, meta.keys, false, err));
+    RCHECK(feed.fedEvents() > 0);
+
+    // Unbound feed is an explicit error, never a silent no-op.
+    raid::PlaybackFeed dead;
+    RCHECK(!dead.advance(0.0, s2, meta.keys, false, err));
+    RCHECK(!err.empty());
+
+    cs.close();
+    std::filesystem::remove(file);
+}
+
+// Window-sliced decode (Reader::rangeWindow) must reproduce range() exactly:
+// same events, same global indices, across randomized and edge-case windows.
+void testSlicedRange() {
+    std::string err;
+
+    // Shared checker: decode the whole file once for boundary times, then
+    // compare range() vs rangeWindow() on edge + pseudo-random windows.
+    auto checkFile = [&](const std::string& path) {
+        raid::Reader rd;
+        RCHECK(rd.open(path, err));
+        const int64_t dur = rd.durationUs();
+        std::vector<raid::Event> all;
+        std::vector<uint64_t> allIdx;
+        RCHECK(rd.range(0, dur + 1, all, err, &allIdx));
+        RCHECK(allIdx.size() == all.size());
+
+        std::vector<std::pair<int64_t, int64_t>> wins;
+        wins.push_back({0, dur + 1});
+        wins.push_back({0, 1});
+        wins.push_back({dur, dur + 1});
+        wins.push_back({dur / 2, dur / 2 + 1});
+        // Windows anchored on real event times (boundary-inclusive/exclusive).
+        for (size_t i = 0; i + 1 < all.size(); i += std::max<size_t>(1, all.size() / 24)) {
+            const int64_t t = all[i].timeUs;
+            wins.push_back({t, t + 1});
+            wins.push_back({t - 1, t + 1});
+            wins.push_back({t, std::min<int64_t>(dur + 1, t + 50000)});
+        }
+        // Pseudo-random windows across the file.
+        uint64_t s = 0x9E3779B97F4A7C15ull;
+        auto rnd = [&] { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+        for (int i = 0; i < 200; ++i) {
+            const int64_t a = int64_t(rnd() % uint64_t(dur + 2));
+            const int64_t b = a + int64_t(rnd() % 3000000);  // up to 3 s
+            wins.push_back({a, std::min<int64_t>(dur + 1, b)});
+        }
+        size_t checked = 0, totalEvents = 0;
+        for (const auto& w : wins) {
+            std::vector<raid::Event> ref, got;
+            std::vector<uint64_t> ri, gi;
+            RCHECK(rd.range(w.first, w.second, ref, err, &ri));
+            RCHECK(rd.rangeWindow(w.first, w.second, got, gi, err));
+            RCHECK(ref.size() == got.size());
+            RCHECK(ri.size() == ref.size() && gi.size() == got.size());
+            size_t bad = 0;
+            for (size_t k = 0; k < ref.size() && k < got.size(); ++k) {
+                const raid::Event& a = ref[k];
+                const raid::Event& b = got[k];
+                if (a.timeUs != b.timeUs || a.lengthUs != b.lengthUs ||
+                    a.pitch != b.pitch || a.lane != b.lane || a.side != b.side ||
+                    a.kind != b.kind || a.flags != b.flags || a.type != b.type ||
+                    a.stack != b.stack || ri[k] != gi[k])
+                    ++bad;
+            }
+            RCHECK(bad == 0);
+            checked += ref.size();
+            totalEvents += ref.size();
+        }
+        RCHECK(checked > 0);
+        (void)totalEvents;
+        rd.close();
+    };
+
+    // ---- Chart A: repeated motif -> pattern-instance / burst ops --------
+    {
+        std::vector<raid::Event> ev;
+        const int64_t motifUs = 40000, repUs = 400000;
+        for (int r = 0; r < 24; ++r) {
+            for (int k = 0; k < 8; ++k) {
+                raid::Event e;
+                e.timeUs = r * repUs + k * motifUs + (r % 5) * 137;  // slight jitter
+                e.lane = uint8_t((k + r) % 4);
+                e.side = uint8_t(k % 2);
+                e.lengthUs = k == 3 ? 50000 : 0;
+                e.flags = k == 7 ? 2 : 0;
+                e.stack = uint16_t(1 + (k == 5 ? 1 : 0));
+                ev.push_back(e);
+            }
+            // Unique filler between repeats so chunks mix literals+instances.
+            for (int k = 0; k < 3; ++k) {
+                raid::Event e;
+                e.timeUs = r * repUs + 300000 + k * 20000;
+                e.lane = uint8_t((r + k) % 4);
+                e.side = uint8_t(r % 2);
+                e.stack = 1;
+                ev.push_back(e);
+            }
+        }
+        std::sort(ev.begin(), ev.end(), [](const raid::Event& a, const raid::Event& b) {
+            return a.timeUs < b.timeUs;
+        });
+        const std::string path = tmpPath("gh_raid_slice_a.raid");
+        raid::EncodeOptions opt;
+        opt.chunkEvents = 512;  // small chunks -> many window/chunk overlaps
+        raid::Info info;
+        RCHECK(raid::writeRaid(path, ev, "{}", opt, &info, err));
+        RCHECK(info.patternCount >= 1);
+        checkFile(path);
+        std::filesystem::remove(path);
+    }
+
+    // ---- Chart B: FL Studio playlist -> group ops with winLo/winHi -------
+    {
+        FlpProject fp;
+        fp.bpm = 150;
+        fp.ppqn = 96;
+        auto mkpat = [](int num, std::initializer_list<std::tuple<uint32_t, uint32_t, uint32_t>> ns) {
+            FlpPattern p;
+            p.number = num;
+            for (const auto& [t, d, pitch] : ns)
+                p.notes.push_back({t, d, pitch, 0, 100, 0});
+            return p;
+        };
+        fp.patterns.push_back(mkpat(1, {{0, 24, 60}, {96, 24, 61}, {192, 24, 62}, {288, 24, 63}}));
+        fp.patterns.push_back(mkpat(2, {{0, 24, 64}, {192, 24, 65}}));
+        fp.patterns.push_back(mkpat(3, {{48, 24, 66}, {144, 24, 67}, {240, 24, 68}}));
+        // Heavily overlapping clips -> op-3 group entries with clip windows.
+        for (int i = 0; i < 12; ++i) {
+            FlpPlaylistItem it;
+            it.pattern = 1 + (i % 3);
+            it.startTick = uint32_t(i * 96);
+            it.lengthTicks = 384;
+            it.track = 1 + (i % 4);
+            fp.playlist.push_back(it);
+        }
+        const std::string path = tmpPath("gh_raid_slice_b.raid");
+        raid::Info info;
+        RCHECK(raid::writeRaidFlp(path, fp, raid::EncodeOptions{}, &info, err));
+        RCHECK(info.logicalEvents > 0);
+        checkFile(path);
+        std::filesystem::remove(path);
+    }
+}
+
 }  // namespace
 
 void runRaidTests() {
@@ -798,6 +1037,9 @@ void runRaidTests() {
     testStreamingRange();
     testChartStream();
     testSessionStreaming();
+    // testPlaybackFeed();  // A/B: isolate late-suite crash
+    testPlaybackFeed();
+    testSlicedRange();
     testIntegrityAndLimits();
     testEmptyAndAsync();
     testEncoderValidation();

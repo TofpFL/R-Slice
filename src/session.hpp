@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -67,8 +68,8 @@ public:
 
     // Accessors used for rendering.
     int keys() const { return keys_; }
-    const std::vector<LaneNote>& lane(int side, int lane) const { return lanes_[side][lane]; }
-    std::vector<LaneNote>& laneMut(int side, int lane) { return lanes_[side][lane]; }
+    const std::deque<LaneNote>& lane(int side, int lane) const { return lanes_[side][lane]; }
+    std::deque<LaneNote>& laneMut(int side, int lane) { return lanes_[side][lane]; }
     double maxSustain(int side, int lane) const { return maxSus_[side][lane]; }
     bool isHolding(int side, int lane) const { return activeHold_[side][lane] >= 0; }
     long long activeHold(int side, int lane) const { return activeHold_[side][lane]; }
@@ -119,8 +120,10 @@ private:
 
     SessionConfig cfg_;
     int keys_ = 4;
-    std::vector<LaneNote> lanes_[2][9];
+    std::deque<LaneNote> lanes_[2][9];
     size_t cursor_[2][9]{};
+    // gcBefore resume hints: leading notes already confirmed dead per lane.
+    size_t gcScan_[2][9]{};
     long long activeHold_[2][9];
     double maxSus_[2][9]{};
     bool held_[9]{};

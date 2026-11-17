@@ -5,6 +5,7 @@
 
 #include "json.hpp"
 #include "raid_chart.hpp"
+#include "session.hpp"
 
 namespace gh::raid {
 
@@ -255,7 +256,12 @@ bool ChartStream::open(const std::string& path, Chart& meta, std::string& err) {
 }
 
 void ChartStream::close() {
-    harvestPrefetch();
+    // In-flight decodes still touch the reader on worker threads. Wait for
+    // every outstanding future before tearing down — closing with decodes
+    // in flight races them against member destruction.
+    for (auto& f : prefetchFuts_) f.wait();
+    prefetchFuts_.clear();
+    prefetchCoveredUs_ = INT64_MIN;
     reader_.close();
     chart_ = Chart{};
 }
@@ -269,21 +275,28 @@ bool ChartStream::pump(int64_t startUs, int64_t endUs, std::vector<Event>& out,
 void ChartStream::prefetch(int64_t startUs, int64_t endUs) {
     if (!reader_.isOpen() || endUs <= startUs) return;
     const Info& info = reader_.info();
-    // Chunks overlapping [startUs, endUs): first chunk with lastTimeUs >=
-    // startUs, through the last with firstTimeUs < endUs.
+    // Only enqueue chunks past the coverage high-water mark: prefetch
+    // windows overlap, and re-requesting an already-warm or in-flight
+    // chunk spends a whole decode for nothing. A chunk straddling the
+    // mark may be requested twice at most.
+    const int64_t freshLo = prefetchCoveredUs_ == INT64_MIN ? startUs
+                                                           : std::max(startUs, prefetchCoveredUs_);
+    prefetchCoveredUs_ = std::max(prefetchCoveredUs_, endUs);
+    // Chunks overlapping [freshLo, endUs): first chunk with lastTimeUs >=
+    // freshLo, through the last with firstTimeUs < endUs.
     size_t first = 0, last = size_t(info.chunkCount);
     // binary search on lastTimeUs via chunkAtOrBefore-style probing; the
     // reader does not expose per-chunk times for iteration, so walk the
     // index through chunkTimeRange (chunkCount is small enough that a
     // linear scan from the lower bound is fine — it is O(chunks in window)).
-    // lower bound: first chunk whose lastTimeUs >= startUs
+    // lower bound: first chunk whose lastTimeUs >= freshLo
     {
         size_t lo = 0, hi = size_t(info.chunkCount);
         while (lo < hi) {
             size_t mid = (lo + hi) / 2;
             int64_t f, l;
             if (!reader_.chunkTimeRange(mid, f, l)) return;
-            if (l >= startUs) hi = mid; else lo = mid + 1;
+            if (l >= freshLo) hi = mid; else lo = mid + 1;
         }
         first = lo;
     }
@@ -293,21 +306,136 @@ void ChartStream::prefetch(int64_t startUs, int64_t endUs) {
         if (f >= endUs) { last = i; break; }
         last = i + 1;
     }
-    for (size_t i = first; i < last; ++i) {
-        prefetchBufs_.emplace_back();
-        prefetchFuts_.push_back(reader_.chunkEventsAsync(i, &prefetchBufs_.back()));
-    }
+    // Batch chunks per worker task: one std::async per chunk meant a
+    // thread spawn (~0.1 ms) for every chunk in the window — hundreds of
+    // spawns landed inside a single advance() and were the dominant
+    // frame spike at high density. ~16 chunks/task keeps all workers
+    // busy while cutting thread creation by an order of magnitude.
+    constexpr size_t kPrefetchBatch = 16;
+    for (size_t b = first; b < last; b += kPrefetchBatch)
+        prefetchFuts_.push_back(
+            reader_.warmChunksAsync(b, std::min(last, b + kPrefetchBatch)));
 }
 
 void ChartStream::harvestPrefetch() {
-    // Each future owns one deque buffer; deque push_back never invalidates
-    // element references, so buffers stay valid until their decode finishes.
-    // Keep everything until every outstanding decode is done, then drop it
-    // all — decoded chunks remain in the reader's LRU cache regardless.
-    for (auto& f : prefetchFuts_)
-        if (f.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
-    prefetchFuts_.clear();
-    prefetchBufs_.clear();
+    // Reap finished futures individually so the outstanding set stays
+    // bounded; decoded chunks live in the reader's LRU cache regardless
+    // of the future's result.
+    size_t w = 0;
+    for (size_t i = 0; i < prefetchFuts_.size(); ++i) {
+        if (prefetchFuts_[i].wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready) {
+            prefetchFuts_[i].get();
+        } else {
+            prefetchFuts_[w++] = std::move(prefetchFuts_[i]);
+        }
+    }
+    prefetchFuts_.resize(w);
+}
+
+// ---------------------------------------------------------- PlaybackFeed --
+
+bool PlaybackFeed::advance(double songMs, Session& session, int keys,
+                           bool mirrorSides, std::string& err) {
+    if (!isBound()) { err = "playback feed not bound"; return false; }
+    const int64_t endUs = int64_t(std::max(0.0, songMs + kLookaheadMs) * 1000.0);
+    lastPumpMs_ = lastConvertMs_ = lastGcMs_ = 0;
+    // Top up the event buffer toward the lookahead horizon in bounded
+    // time slices. Fetching the whole 4 s horizon in one pump() used to
+    // decode every missing chunk synchronously on this thread — hundreds
+    // of ms at high density. Slices preserve event order (contiguous,
+    // appended in time order) while capping per-frame fetch work; the
+    // horizon stays ahead of the playhead so judgement is unaffected.
+    {
+        const auto p0 = std::chrono::steady_clock::now();
+        // Emergency floor: the buffer must always reach this far past the
+        // playhead, however many slices that takes (bounded by
+        // kMaxEmergencySlices). This keeps judgement supplied after seeks
+        // and large song-clock steps; the 4 s horizon itself still fills
+        // gradually at kMaxFetchSlices per call.
+        const int64_t emergencyUs =
+            int64_t(std::max(0.0, songMs) * 1000.0) + kEmergencyAheadUs;
+        int slices = 0;
+        while (fedUs_ < endUs &&
+               (fedUs_ < emergencyUs ? slices < kMaxEmergencySlices
+                                     : slices < kMaxFetchSlices)) {
+            if (bufPos_ >= evsBuf_.size()) {
+                evsBuf_.clear();
+                idxBuf_.clear();
+                bufPos_ = 0;
+            }
+            // fedUs_ starts at a negative sentinel ("from file start"), so
+            // the first slice is anchored at 0 rather than fedUs_ + slice.
+            const int64_t sliceEnd = fedUs_ < 0 ? std::min(endUs, kSliceUs)
+                                                : std::min(endUs, fedUs_ + kSliceUs);
+            const size_t before = evsBuf_.size();
+            if (!stream_->pump(fedUs_, sliceEnd, evsBuf_, idxBuf_, err)) {
+                lastPumpMs_ = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - p0).count();
+                return false;
+            }
+            fedEvents_ += evsBuf_.size() - before;
+            fedUs_ = sliceEnd;
+            ++slices;
+        }
+        lastPumpMs_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - p0).count();
+    }
+    if (bufPos_ < evsBuf_.size()) {
+        const auto c0 = std::chrono::steady_clock::now();
+        const size_t stop = std::min(evsBuf_.size(), bufPos_ + kMaxConvert);
+        for (; bufPos_ < stop; ++bufPos_) {
+            const Event& e = evsBuf_[bufPos_];
+            fedStack_ += std::max<uint16_t>(1, e.stack);
+            LaneNote ln;
+            ln.t = double(e.timeUs) / 1000.0;
+            ln.len = double(e.lengthUs) / 1000.0;
+            ln.kind = e.kind;
+            ln.flags = e.flags;
+            ln.type = e.type;
+            ln.stack = std::max<uint16_t>(1, e.stack);
+            ln.id = uint32_t(idxBuf_[bufPos_]);  // global expanded index (stable across rewind)
+            const int side = int(e.side) ^ (mirrorSides ? 1 : 0);
+            if (e.lane < uint32_t(keys)) {
+                session.appendLaneNote(side, int(e.lane), ln);
+                ++appendedEvents_;
+            }
+        }
+        lastConvertMs_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - c0).count();
+        if (bufPos_ >= evsBuf_.size()) {
+            evsBuf_.clear();
+            idxBuf_.clear();
+            bufPos_ = 0;
+        }
+        const auto g0 = std::chrono::steady_clock::now();
+        session.gcBefore(songMs);
+        lastGcMs_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - g0).count();
+    }
+    if (endUs >= prefetchUs_) {
+        // Prefetch far enough ahead for workers to keep up, but never so
+        // far that the request window exceeds what the LRU can hold —
+        // beyond that, tail chunks are evicted before use and the decode
+        // work is wasted (and near chunks get evicted by far ones).
+        // Half the event budget is reserved for the window itself.
+        double prefetchMs = kPrefetchMs;
+        const double fedSec = fedUs_ > 0 ? double(fedUs_) / 1e6 : 0.0;
+        const uint64_t cap = stream_->cachedEventCapacity();
+        if (fedSec > 1.0 && fedEvents_ > 0 && cap > 0) {
+            const double evPerSec = double(fedEvents_) / fedSec;
+            const double fitSec = double(cap / 2) / std::max(1.0, evPerSec);
+            prefetchMs = std::min(kPrefetchMs, std::max(2000.0, fitSec * 1000.0));
+        }
+        // Anchor at 0: on the first call (and after resetPrefetch) this
+        // warms the whole startup window on workers instead of leaving
+        // the first ~4 s of chart for the pump to decode synchronously.
+        // Later calls are unaffected — prefetchCoveredUs_ collapses the
+        // request range to only the new tail.
+        stream_->prefetch(int64_t(0), endUs + int64_t(prefetchMs * 1000.0));
+        prefetchUs_ = endUs + int64_t(prefetchMs * 500.0);
+    }
+    return true;
 }
 
 }  // namespace gh::raid

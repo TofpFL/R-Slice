@@ -313,6 +313,7 @@ void setVsync(bool on) {
     const EGLDisplay d = eglGetCurrentDisplay();
     if (d != EGL_NO_DISPLAY) eglSwapInterval(d, on ? 1 : 0);
 }
+void raiseTimerResolution() {}
 
 void afterWindowInit() {
     g_background = false;
@@ -441,6 +442,28 @@ void afterWindowInit() {}
 void setVsync(bool on) {
     if (on) SetWindowState(FLAG_VSYNC_HINT);
     else ClearWindowState(FLAG_VSYNC_HINT);
+}
+#if defined(_WIN32)
+// Declared by hand so windows.h stays out of this TU (it does not mix
+// with raylib.h); kernel32 exports used to reach ntdll's timer API.
+extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleA(const char*);
+extern "C" __declspec(dllimport) void* __stdcall GetProcAddress(void*, const char*);
+using NtSetTimerResolution_t = long (__stdcall*)(unsigned long, int, unsigned long*);
+#endif
+
+void raiseTimerResolution() {
+#if defined(_WIN32)
+    // Windows' default ~15.6 ms timer quantum makes sleep_for() useless
+    // for frame pacing; the error shows as judder once the desktop
+    // compositor stops masking it in fullscreen.
+    void* ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return;
+    const auto fn = reinterpret_cast<NtSetTimerResolution_t>(
+        GetProcAddress(ntdll, "NtSetTimerResolution"));
+    if (!fn) return;
+    unsigned long cur = 0;
+    fn(5000, 1, &cur);  // 0.5 ms requested resolution
+#endif
 }
 bool inBackground() { return false; }
 bool takeResumed() { return false; }

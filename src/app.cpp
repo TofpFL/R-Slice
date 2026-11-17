@@ -194,6 +194,17 @@ void App::toggleFullscreen() {
     if (platform::kAndroid) return;
     ToggleBorderlessWindowed();
     settings.fullscreen = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
+    monitorPollAt_ = 0;  // display mode may have changed
+}
+
+void App::pollMonitorRefresh() {
+    if (platform::kAndroid) return;
+    // GetVideoMode under the hood — cheap enough at 1 Hz, and it picks up
+    // monitor moves (GetCurrentMonitor follows the window/mouse) and
+    // mode changes (fullscreen toggle, resolution switch).
+    const int hz = GetMonitorRefreshRate(GetCurrentMonitor());
+    if (hz > 0) monitorHz_ = hz;
+    monitorPollAt_ = nowSec() + 1.0;
 }
 
 int App::run(int argc, char** argv) {
@@ -217,6 +228,10 @@ int App::run(int argc, char** argv) {
             autoRun.editorSong = next();
             if (i + 1 < argc && argv[i + 1][0] != '-') autoRun.diff = next();
         } else if (!std::strcmp(a, "--editor-export")) autoRun.editorExport = next();
+        else if (!std::strcmp(a, "--vchart")) {
+            vchartSong = next();
+            if (i + 1 < argc && argv[i + 1][0] != '-') vchartDiff = next();
+        } else if (!std::strcmp(a, "--video")) vchartVideo = next();
         else if (!std::strcmp(a, "--list-songs")) listSongs = true;
         else if (!std::strcmp(a, "--check-charts")) checkCharts = true;
         else if (!std::strcmp(a, "--touch")) touchMode = true;
@@ -294,6 +309,7 @@ int App::run(int argc, char** argv) {
     platform::setWindowIcon();
     platform::setVsync(settings.vsync);  // explicit both ways: some drivers default to on
     SetExitKey(KEY_NULL);
+    platform::raiseTimerResolution();
     if (!platform::kAndroid) {
         SetWindowMinSize(640, 360);
         if (settings.fullscreen && !autoRun.enabled) ToggleBorderlessWindowed();
@@ -329,6 +345,9 @@ int App::run(int argc, char** argv) {
         r.diff = autoRun.diff;
         mods.botplay = autoRun.botplay;
         state_ = makePlay(r);
+    } else if (!vchartSong.empty()) {
+        const std::string id = vchartSong.find(':') == std::string::npos ? "builtin:" + vchartSong : vchartSong;
+        state_ = makeVChart(id, vchartDiff, vchartVideo);
     } else if (!autoRun.editorSong.empty()) state_ = makeChartEditor(autoRun.editorSong, autoRun.diff);
     else if (autoRun.state == "menu") state_ = makeMainMenu();
     else if (autoRun.state == "freeplay") state_ = makeFreeplay();
@@ -368,8 +387,17 @@ int App::run(int argc, char** argv) {
         const int cap = settings.vsync ? 0 : settings.fpsCap;
         if (cap > 0 && now < nextFrame) {
             const double wait = nextFrame - now;
-            if (wait > 0.0012) std::this_thread::sleep_for(std::chrono::microseconds(500));
-            else std::this_thread::yield();
+            // Sleep until just before the deadline, then spin-poll. The
+            // spin window scales with the frame interval (max ~1.5 ms) so
+            // high caps don't spend the whole frame spinning: 240 FPS
+            // spins ~1.5 ms, 500 FPS ~0.7 ms, 1000 FPS ~0.35 ms. Input
+            // stays polled every iteration, keeping input latency low.
+            const double spinSec = std::min(0.0015, 0.35 / double(cap));
+            if (wait > spinSec + 0.0004)
+                std::this_thread::sleep_for(std::chrono::microseconds(
+                    uint64_t((wait - spinSec) * 1e6)));
+            else
+                while (nowSec() + clockShift_ < nextFrame) std::this_thread::yield();
             continue;
         }
         if (cap > 0) {
@@ -404,6 +432,7 @@ void App::frame() {
         shownH_ = GetScreenHeight();
         platform::log(TextFormat("screen size %dx%d", shownW_, shownH_));
     }
+    if (now >= monitorPollAt_) pollMonitorRefresh();
     if (platform::takeResumed()) {
         platform::log("back from the background");
         platform::setVsync(settings.vsync);  // a new surface starts with the system's default
@@ -548,7 +577,7 @@ void App::drawFpsPanel() {
     if (s.showFps) {
         // Red at half the frame limit or under, as Psych's counter.
         const int f = int(fps + 0.5f);
-        int cap = s.fpsCap > 0 && !s.vsync ? s.fpsCap : GetMonitorRefreshRate(GetCurrentMonitor());
+        int cap = s.fpsCap > 0 && !s.vsync ? s.fpsCap : (monitorHz_ > 0 ? monitorHz_ : GetMonitorRefreshRate(GetCurrentMonitor()));
         if (cap <= 0) cap = 60;
         lines.push_back({TextFormat("%d FPS", f), f <= cap / 2 ? Color{255, 90, 90, 255} : WHITE});
     }

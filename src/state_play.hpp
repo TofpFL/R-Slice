@@ -226,17 +226,28 @@ private:
     Session session_;
     SessionConfig cfg_;
     // .raid streaming: notes arrive in playback windows instead of
-    // chart_.notes. fedUs_/prefetchUs_ are the pump/prefetch horizons.
+    // chart_.notes. feed_ owns the pump/prefetch cursors, lookahead policy,
+    // Event->LaneNote conversion and session GC (PlaybackFeed coordinator).
     std::shared_ptr<raid::ChartStream> noteStream_;
+    raid::PlaybackFeed feed_;
     bool streamMirror_ = false, streamFailed_ = false;
-    int64_t fedUs_ = 0, prefetchUs_ = 0;
-    uint64_t fedEvents_ = 0, appendedEvents_ = 0;
     double lastFeedLogMs_ = -1e18;
     // Pattern-log modifier (.raid only): appends op-stream segments to
     // <userDir>/raid_pattern_log.txt as the playhead advances.
     std::unique_ptr<raid::PatternLogger> patternLog_;
     void startPatternLog();
     Stage stage_;
+    // "Video background" modifier: a looping video from the song mod's
+    // videos/ folder, drawn behind the stage/scene as the backdrop.
+    std::unique_ptr<VideoPlayer> bgVideo_;
+    scene::Files bgVideoFiles_;
+    std::string bgVideoName_;
+    int bgVideoState_ = 0;  // 0 off, 1 resolving, 2 playing, 3 no video
+    double bgVideoRetry_ = 0;
+    void setupVideoBg();
+    void updateVideoBg(double dt);
+    void drawVideoBg() const;
+    bool videoBgActive() const { return bgVideo_ && bgVideo_->texture().id; }
     CharacterState left_, right_;
     Color leftColor_{}, rightColor_{};
     bool playerLeft_ = false;

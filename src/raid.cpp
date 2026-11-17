@@ -66,8 +66,15 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <queue>
 #include <tuple>
 #include <unordered_map>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "miniz.h"
 #include "raid.hpp"
@@ -112,11 +119,17 @@ struct Cur {
     uint64_t u64() { return uint64_t(u32()) | (uint64_t(u32()) << 32); }
     int64_t i64() { return int64_t(u64()); }
     uint64_t var() {
-        uint64_t v = 0;
-        int s = 0;
+        // Fast path: single-byte varint (values < 128) — the common case for
+        // time deltas, lengths, attrs, types and stacks in dense charts.
+        if (p >= end) { ok = false; return 0; }
+        uint8_t c = uint8_t(*p);
+        if (!(c & 0x80)) { ++p; return c; }
+        uint64_t v = c & 0x7F;
+        int s = 7;
+        ++p;
         for (;;) {
-            uint8_t c = u8();
-            if (!ok) return 0;
+            if (p >= end) { ok = false; return 0; }
+            c = uint8_t(*p++);
             v |= uint64_t(c & 0x7F) << s;
             if (!(c & 0x80)) return v;
             s += 7;
@@ -271,7 +284,28 @@ struct EmitOut {
     std::vector<Event>* out;
     uint64_t produced = 0;
     uint64_t limit = kMaxChunkExpand;
+    // Sliced-decode playback window: events outside [qLo,qHi) are not
+    // appended, but still count toward `produced` (they occupy output
+    // slots). indices, when set, receives each emitted event's position in
+    // the chunk's FULL output sequence (== the index range() would assign).
+    int64_t qLo = INT64_MIN, qHi = INT64_MAX;
+    std::vector<uint64_t>* indices = nullptr;
+    uint64_t indexBase = 0;  // added to every emitted index (chunk firstEvent)
 };
+
+// Appends one event plus its output-sequence index (when requested).
+inline void emitOne(EmitOut& eo, const Event& e, uint64_t seqIdx) {
+    eo.out->push_back(e);
+    if (eo.indices) eo.indices->push_back(eo.indexBase + seqIdx);
+}
+
+// Saturating w - s for window arithmetic on int64 bounds (s is a repeat
+// shift, always far below 2^62 in valid files).
+inline int64_t satSub(int64_t w, int64_t s) {
+    if (s > 0) return w < INT64_MIN + s ? INT64_MIN : w - s;
+    if (s < 0) return w > INT64_MAX + s ? INT64_MAX : w - s;
+    return w;
+}
 
 bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
              int depth, EmitOut& eo, std::string& err);
@@ -292,7 +326,11 @@ bool emitLiteral(Cur& cur, bool relative, const PatternRec* pat, const Ctx& ctx,
                  EmitOut& eo, std::string& err) {
     uint32_t n = uint32_t(cur.u32());
     if (!cur.ok || n == 0 || n > (1u << 24)) { err = "bad literal count"; return false; }
-    std::vector<Event> tmp((size_t)n);  // extra parens: not a function decl
+    // Column decode needs all n events buffered before fields interleave.
+    // A thread_local scratch avoids a heap allocation per literal op;
+    // decode runs are serialized per thread by the decode semaphore.
+    static thread_local std::vector<Event> tmp;
+    tmp.resize(n);  // (extra parens: not a function decl)
     // time column
     int64_t t = relative ? ctx.timeBase : 0;
     if (relative) {
@@ -312,10 +350,14 @@ bool emitLiteral(Cur& cur, bool relative, const PatternRec* pat, const Ctx& ctx,
         tmp[k].timeUs = t;
     }
     // Group-op windows clip by absolute time; count what survives before
-    // spending work on the property columns.
-    size_t kept = 0;
-    for (uint32_t k = 0; k < n; ++k)
-        kept += tmp[k].timeUs >= ctx.clipLo && tmp[k].timeUs < ctx.clipHi;
+    // spending work on the property columns. Unclipped literals keep all n.
+    const bool unclipped = ctx.clipLo == INT64_MIN && ctx.clipHi == INT64_MAX;
+    size_t kept = n;
+    if (!unclipped) {
+        kept = 0;
+        for (uint32_t k = 0; k < n; ++k)
+            kept += tmp[k].timeUs >= ctx.clipLo && tmp[k].timeUs < ctx.clipHi;
+    }
     if (eo.produced + kept > eo.limit) { err = "chunk expands beyond its declared size"; return false; }
     // length column
     for (uint32_t k = 0; k < n; ++k) {
@@ -358,12 +400,89 @@ bool emitLiteral(Cur& cur, bool relative, const PatternRec* pat, const Ctx& ctx,
         tmp[k].stack = uint16_t(v);
         if (tmp[k].stack == 0) tmp[k].stack = 1;
     }
-    for (uint32_t k = 0; k < n; ++k) {
-        if (tmp[k].timeUs < ctx.clipLo || tmp[k].timeUs >= ctx.clipHi) continue;
-        eo.out->push_back(tmp[k]);
+    // tmp[0..w) are the format-kept events in output order; w == kept.
+    size_t w = n;
+    if (!unclipped) {
+        w = 0;
+        for (uint32_t k = 0; k < n; ++k) {
+            if (tmp[k].timeUs < ctx.clipLo || tmp[k].timeUs >= ctx.clipHi) continue;
+            tmp[w++] = tmp[k];
+        }
+    }
+    if (!eo.indices && eo.qLo == INT64_MIN && eo.qHi == INT64_MAX) {
+        eo.out->insert(eo.out->end(), tmp.begin(), tmp.begin() + w);
+    } else {
+        // Sliced decode: emit only events inside the playback window, each
+        // tagged with its slot in the chunk's full output sequence.
+        const uint64_t seqBase = eo.produced;
+        for (size_t j = 0; j < w; ++j) {
+            const Event& e = tmp[j];
+            if (e.timeUs < eo.qLo || e.timeUs >= eo.qHi) continue;
+            emitOne(eo, e, seqBase + j);
+        }
     }
     eo.produced += kept;
     return true;
+}
+
+// Leaf-pattern instance expansion for sliced decode. A leaf pattern's op
+// stream contains only literals, so its expansion is a fixed local event
+// list: decode it once at the repeat-0 transform, then serve every repeat
+// by arithmetic windowing — two binary searches per repeat instead of a
+// full op-stream re-expansion. Returns 0 = emitted, 1 = caller should use
+// the reference per-repeat loop (pattern too large for scratch or unsorted),
+// -1 = hard error (err set).
+int emitLeafCached(const Env& env, const PatternRec& child, int64_t unit,
+                   uint32_t reps, int64_t anchor, int64_t pitchDelta,
+                   int64_t laneDelta, const Ctx& ctx, int depth,
+                   EmitOut& eo, std::string& err) {
+    std::vector<Event> pat;
+    {
+        EmitOut pe{&pat, 0, kMaxChunkExpand};
+        Ctx pc{ctx.timeBase + anchor, ctx.pitchBase + pitchDelta,
+               ctx.laneBase + laneDelta, INT64_MIN, INT64_MAX};
+        Cur cc{env.blob->data() + child.off, env.blob->data() + child.off + child.len};
+        if (!emitOps(cc, env, &child, pc, depth + 1, pe, err)) {
+            if (err == "chunk expands beyond its declared size") { err.clear(); return 1; }
+            return -1;
+        }
+    }
+    // Binary search below requires sorted local times; the format's output
+    // order guarantees it, but a pathological pattern falls back safely.
+    for (size_t i = 1; i < pat.size(); ++i)
+        if (pat[i].timeUs < pat[i - 1].timeUs) return 1;
+    auto cmp = [](const Event& e, int64_t v) { return e.timeUs < v; };
+    for (uint32_t r = 0; r < reps; ++r) {
+        const int64_t shift = int64_t(r) * unit;
+        // Reference emitLiteral rejects a negative first-event time per
+        // repeat; pat.front() is the minimum (sortedness checked above).
+        if (!pat.empty() && pat.front().timeUs + shift < 0) {
+            err = "negative event time";
+            return -1;
+        }
+        // Format clip and playback window, shifted into repeat-0 time.
+        const int64_t kLo = satSub(ctx.clipLo, shift), kHi = satSub(ctx.clipHi, shift);
+        const int64_t qLo = satSub(eo.qLo, shift),   qHi = satSub(eo.qHi, shift);
+        auto first = std::lower_bound(pat.begin(), pat.end(), kLo, cmp);
+        auto last  = std::lower_bound(pat.begin(), pat.end(), kHi, cmp);
+        const uint64_t kept = uint64_t(last - first);
+        if (eo.produced + kept > eo.limit) {
+            err = "chunk expands beyond its declared size";
+            return -1;
+        }
+        const uint64_t repBase = eo.produced;
+        if (kept && qLo < qHi) {
+            auto qf = std::lower_bound(first, last, qLo, cmp);
+            auto ql = std::lower_bound(first, last, qHi, cmp);
+            for (auto it = qf; it != ql; ++it) {
+                Event e = *it;
+                e.timeUs += shift;
+                emitOne(eo, e, repBase + uint64_t(it - first));
+            }
+        }
+        eo.produced += kept;
+    }
+    return 0;
 }
 
 bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
@@ -399,6 +518,16 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
                 return false;
             }
             if (reps > eo.limit) { err = "pattern repeat count too large"; return false; }
+            bool done = false;
+            if (reps && env.hasInst && pid < env.hasInst->size() &&
+                !(*env.hasInst)[pid]) {
+                const int rc = emitLeafCached(env, child, int64_t(child.spanUs),
+                                              reps, anchor, pitchDelta, laneDelta,
+                                              ctx, depth, eo, err);
+                if (rc < 0) return false;
+                done = (rc == 0);
+            }
+            if (!done)
             for (uint32_t r = 0; r < reps; ++r) {
                 Ctx sub{ctx.timeBase + anchor + int64_t(r) * int64_t(child.spanUs),
                         ctx.pitchBase + pitchDelta, ctx.laneBase + laneDelta,
@@ -428,6 +557,16 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
                 return false;
             }
             if (reps > eo.limit) { err = "pattern repeat count too large"; return false; }
+            bool done = false;
+            if (reps && env.hasInst && pid < env.hasInst->size() &&
+                !(*env.hasInst)[pid]) {
+                const int rc = emitLeafCached(env, child, stride, reps,
+                                              anchor, pitchDelta, laneDelta,
+                                              ctx, depth, eo, err);
+                if (rc < 0) return false;
+                done = (rc == 0);
+            }
+            if (!done)
             for (uint32_t r = 0; r < reps; ++r) {
                 Ctx sub{ctx.timeBase + anchor + int64_t(r) * stride,
                         ctx.pitchBase + pitchDelta, ctx.laneBase + laneDelta,
@@ -472,11 +611,17 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
             // the output. No merged copy: peak memory stays one chunk's
             // worth of events, same as a literal run.
             const uint64_t budget = eo.limit - eo.produced;
-            std::vector<std::vector<Event>> parts(ents.size());
+            // One contiguous arena + per-entry offset/count instead of a
+            // vector per entry; merge via min-heap on (timeUs, part index),
+            // which reproduces the old linear scan's tie-break exactly.
+            std::vector<Event> arena;
+            arena.reserve(size_t(std::min<uint64_t>(budget, uint64_t(1) << 16)));
+            std::vector<size_t> partOff(ents.size()), partCnt(ents.size());
             uint64_t total = 0;
             for (size_t i = 0; i < ents.size(); ++i) {
                 const GEnt& ge = ents[i];
-                EmitOut sub{&parts[i], 0, budget};
+                const size_t start = arena.size();
+                EmitOut sub{&arena, 0, budget};
                 for (uint32_t r = 0; r < ge.reps; ++r) {
                     Ctx sctx{ctx.timeBase + ge.anchor + int64_t(r) * int64_t(ge.child->spanUs),
                              ctx.pitchBase + ge.pd, ctx.laneBase + ge.ld, ge.lo, ge.hi};
@@ -484,21 +629,32 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
                            env.blob->data() + ge.child->off + ge.child->len};
                     if (!emitOps(cc, env, ge.child, sctx, depth + 1, sub, err)) return false;
                 }
+                partOff[i] = start;
+                partCnt[i] = arena.size() - start;
                 total += sub.produced;
                 if (total > budget) { err = "chunk expands beyond its declared size"; return false; }
             }
-            std::vector<size_t> pos(parts.size(), 0);
-            for (uint64_t k = 0; k < total; ++k) {
-                size_t best = parts.size();
-                int64_t bt = 0;
-                for (size_t i = 0; i < parts.size(); ++i) {
-                    if (pos[i] < parts[i].size() &&
-                        (best == parts.size() || parts[i][pos[i]].timeUs < bt)) {
-                        best = i;
-                        bt = parts[i][pos[i]].timeUs;
-                    }
-                }
-                eo.out->push_back(parts[best][pos[best]++]);
+            std::priority_queue<std::pair<int64_t, size_t>,
+                                std::vector<std::pair<int64_t, size_t>>,
+                                std::greater<>> heap;
+            for (size_t i = 0; i < ents.size(); ++i)
+                if (partCnt[i]) heap.emplace(arena[partOff[i]].timeUs, i);
+            std::vector<size_t> pos(ents.size(), 0);
+            // gBase: this group's first slot in the chunk's output sequence.
+            // Merged events keep reference order; only the playback-window
+            // subset is appended, each tagged with its merge rank.
+            const uint64_t gBase = eo.produced;
+            uint64_t mergePos = 0;
+            while (!heap.empty()) {
+                const size_t i = heap.top().second;
+                heap.pop();
+                const size_t k = partOff[i] + pos[i]++;
+                const Event& e = arena[k];
+                if (e.timeUs >= eo.qLo && e.timeUs < eo.qHi)
+                    emitOne(eo, e, gBase + mergePos);
+                ++mergePos;
+                if (pos[i] < partCnt[i])
+                    heap.emplace(arena[partOff[i] + pos[i]].timeUs, i);
             }
             eo.produced += total;
         } else {
@@ -1122,6 +1278,120 @@ bool isRaidFile(const std::string& path) {
     return ok;
 }
 
+// ------------------------------------------------------- embedded packs --
+//
+// Trailer appended after the last chunk (see raid.hpp). The footer is the
+// last 24 bytes of the file: magic + absolute offset of the assets blob +
+// crc32 of the blob + reserved.
+namespace {
+constexpr char kAssetsMagic[8] = {'R', 'A', 'I', 'D', 'A', 'S', 'S', 'T'};
+constexpr size_t kAssetsFooterSize = 24;
+constexpr uint32_t kMaxEmbeddedAssets = 256;
+constexpr uint64_t kMaxAssetBytes = 512ull << 20;
+}  // namespace
+
+bool embedAssets(const std::string& path,
+                 const std::vector<EmbeddedAsset>& assets, std::string& err) {
+    err.clear();
+    if (assets.size() > kMaxEmbeddedAssets) {
+        err = "too many embedded assets";
+        return false;
+    }
+    FILE* f = std::fopen(path.c_str(), "r+b");
+    if (!f) { err = "cannot open " + path; return false; }
+    auto fail = [&](const char* m) { std::fclose(f); err = m; return false; };
+
+    unsigned char h[4] = {};
+    if (std::fread(h, 1, 4, f) != 4 || std::memcmp(h, kMagic, 4) != 0)
+        return fail("not a raid file");
+#if defined(_WIN32)
+    if (_fseeki64(f, 0, SEEK_END) != 0) return fail("cannot seek");
+    const uint64_t fileSize = uint64_t(_ftelli64(f));
+#else
+    if (fseeko(f, 0, SEEK_END) != 0) return fail("cannot seek");
+    const uint64_t fileSize = uint64_t(ftello(f));
+#endif
+
+    // An existing trailer is overwritten in place; anything else appends
+    // at EOF.
+    uint64_t writeOff = fileSize;
+    if (fileSize >= kHeaderSize + kAssetsFooterSize) {
+        unsigned char foot[kAssetsFooterSize];
+#if defined(_WIN32)
+        const bool seekOk = _fseeki64(f, (long long)(fileSize - kAssetsFooterSize), SEEK_SET) == 0;
+#else
+        const bool seekOk = fseeko(f, off_t(fileSize - kAssetsFooterSize), SEEK_SET) == 0;
+#endif
+        if (seekOk && std::fread(foot, 1, kAssetsFooterSize, f) == kAssetsFooterSize &&
+            std::memcmp(foot, kAssetsMagic, 8) == 0) {
+            writeOff = uint64_t(foot[8]) | (uint64_t(foot[9]) << 8) |
+                       (uint64_t(foot[10]) << 16) | (uint64_t(foot[11]) << 24) |
+                       (uint64_t(foot[12]) << 32) | (uint64_t(foot[13]) << 40) |
+                       (uint64_t(foot[14]) << 48) | (uint64_t(foot[15]) << 56);
+            if (writeOff > fileSize - kAssetsFooterSize) writeOff = fileSize;
+        }
+    }
+
+    // v2 trailer when any record is an external reference; pure-embed files
+    // keep the v1 layout byte-for-byte.
+    bool hasRef = false;
+    for (const EmbeddedAsset& a : assets) hasRef |= a.reference;
+    const uint32_t blobVersion = hasRef ? 1 : 0;
+
+    Buf blob;
+    blob.u32(uint32_t(assets.size()));
+    for (const EmbeddedAsset& a : assets) {
+        if (a.reference) {
+            if (a.name.size() > 4096 || a.refPath.size() > 4096) {
+                err = "asset reference too long: " + a.name;
+                std::fclose(f);
+                return false;
+            }
+            blob.u8(1);
+            blob.u32(uint32_t(a.name.size()));
+            blob.raw(a.name.data(), a.name.size());
+            blob.u64(uint64_t(a.refPath.size()));
+            if (!a.refPath.empty()) blob.raw(a.refPath.data(), a.refPath.size());
+            continue;
+        }
+        if (a.name.size() > 4096 || a.data.size() > size_t(kMaxAssetBytes)) {
+            err = "embedded asset too large: " + a.name;
+            std::fclose(f);
+            return false;
+        }
+        if (blobVersion) blob.u8(0);
+        blob.u32(uint32_t(a.name.size()));
+        blob.raw(a.name.data(), a.name.size());
+        blob.u64(uint64_t(a.data.size()));
+        if (!a.data.empty()) blob.raw(a.data.data(), a.data.size());
+    }
+    Buf foot;
+    foot.raw(kAssetsMagic, 8);
+    foot.u64(writeOff);
+    foot.u32(crcOf(blob.b.data(), blob.b.size()));
+    foot.u32(blobVersion);
+
+#if defined(_WIN32)
+    const bool seekOk = _fseeki64(f, (long long)writeOff, SEEK_SET) == 0;
+#else
+    const bool seekOk = fseeko(f, off_t(writeOff), SEEK_SET) == 0;
+#endif
+    if (!seekOk) return fail("cannot seek");
+    const bool wrote =
+        (blob.b.empty() || std::fwrite(blob.b.data(), 1, blob.b.size(), f) == blob.b.size()) &&
+        std::fwrite(foot.b.data(), 1, foot.b.size(), f) == foot.b.size();
+    if (!wrote) return fail("cannot write assets trailer");
+    const uint64_t newSize = writeOff + blob.b.size() + foot.b.size();
+#if defined(_WIN32)
+    const bool truncOk = _chsize_s(_fileno(f), (long long)newSize) == 0;
+#else
+    const bool truncOk = ftruncate(fileno(f), off_t(newSize)) == 0;
+#endif
+    std::fclose(f);
+    if (!truncOk) { err = "cannot truncate assets trailer"; return false; }
+    return true;
+}
+
 bool writeRaid(const std::string& path, const std::vector<Event>& events,
                std::string_view metaJson, const EncodeOptions& opt,
                Info* statsOut, std::string& err) {
@@ -1438,7 +1708,8 @@ bool writeRaidDoc(const std::string& path, const std::vector<char>& patSection,
 constexpr uint32_t kFlpBlockEvents = 3000000;
 
 bool writeRaidFlp(const std::string& path, const FlpProject& project,
-                  const EncodeOptions& opt, Info* statsOut, std::string& err) {
+                  const EncodeOptions& opt, Info* statsOut, std::string& err,
+                  std::string_view opponentName, std::string_view playerName) {
     err.clear();
     if (opt.chunkEvents == 0 || opt.chunkEvents > uint32_t(kMaxChunkExpand) ||
         opt.compressLevel < 1 || opt.compressLevel > 10) {
@@ -1573,9 +1844,28 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
         size_t srcBegin = 0, srcEnd = 0;          // index range inside *src
     };
     std::vector<Def> defs;
+    // A DefRef ties one clip window's block to its canonical pattern def.
+    // Blocks whose literal payload is byte-identical share the Def (and its
+    // pattern-table slot) while keeping their own source range and origin —
+    // anchor/lane compensation happens per instance at group-emit time.
+    struct DefRef {
+        uint32_t def = 0;
+        const std::vector<Event>* src = nullptr;
+        size_t srcBegin = 0, srcEnd = 0;
+        int64_t originUs = 0;
+        int32_t originLane = 0;
+    };
+    // Canonical dedup: hash literal payloads, verify byte equality — a hash
+    // hit alone never merges patterns.
+    std::unordered_map<uint64_t, std::vector<uint32_t>> canonIdx;
+    auto fnv1a = [](const std::vector<char>& b) {
+        uint64_t h = 1469598103934665603ull;
+        for (char c : b) { h ^= uint8_t(c); h *= 1099511628211ull; }
+        return h;
+    };
     // Defs are shared per (pattern, rotation, window): clips with the same
     // trim window point at the same table entries.
-    std::map<std::tuple<int, int64_t, int64_t, int64_t>, std::vector<uint32_t>> winDefs;
+    std::map<std::tuple<int, int64_t, int64_t, int64_t>, std::vector<DefRef>> winDefs;
 
     // Rotated views for looping clips: pattern note t -> (t - shift) mod
     // period, re-sorted. std::map nodes keep the vectors' addresses stable
@@ -1616,7 +1906,7 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
         n1 = size_t(std::lower_bound(ev.begin(), ev.end(), hi, cmp) - ev.begin());
     };
 
-    auto defsFor = [&](const Seg& s) -> const std::vector<uint32_t>* {
+    auto defsFor = [&](const Seg& s) -> const std::vector<DefRef>* {
         const std::vector<Event>* ev =
             s.rotShift >= 0 ? rotSrc(s.pattern, s.rotShift) : eventsFor(s.pattern);
         if (!ev) return nullptr;
@@ -1626,7 +1916,7 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
         const auto key = std::make_tuple(s.pattern, s.rotShift, s.loUs, s.hiUs);
         auto it = winDefs.find(key);
         if (it != winDefs.end()) return &it->second;
-        std::vector<uint32_t> ids;
+        std::vector<DefRef> ids;
         for (size_t b = n0; b < n1; b += kFlpBlockEvents) {
             const size_t e = std::min(b + size_t(kFlpBlockEvents), n1);
             Def d;
@@ -1644,8 +1934,31 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
             for (size_t k = b; k < e; ++k) {
                 if (ev->at(k).side == 1) ++d.sideP; else ++d.sideO;
             }
-            ids.push_back(uint32_t(defs.size()));
-            defs.push_back(std::move(d));
+            // Canonical dedup: identical literal payloads decode to identical
+            // relative event sequences, so they share one pattern-table slot.
+            // Per-instance anchor/lane deltas (computed from srcBegin at emit
+            // time) preserve exact placement — payload equality is verified
+            // byte-for-byte, never trusted on hash alone.
+            const uint64_t h = fnv1a(d.ops.b);
+            uint32_t did = UINT32_MAX;
+            auto& bucket = canonIdx[h];
+            for (uint32_t cand : bucket) {
+                const Def& cd = defs[cand];
+                if (cd.spanUs == d.spanUs && cd.ops.b == d.ops.b) { did = cand; break; }
+            }
+            DefRef ref;
+            ref.src = ev;
+            ref.srcBegin = b;
+            ref.srcEnd = e;
+            ref.originUs = d.originUs;
+            ref.originLane = d.originLane;
+            if (did == UINT32_MAX) {
+                did = uint32_t(defs.size());
+                bucket.push_back(did);
+                defs.push_back(std::move(d));
+            }
+            ref.def = did;
+            ids.push_back(ref);
         }
         return &winDefs.emplace(key, std::move(ids)).first->second;
     };
@@ -1656,14 +1969,18 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
     // Unique stored notes: every def holds a playlist clip window's events,
     // so this counts exactly the notes that can sound. Pattern-resident
     // notes outside every clip window never reach a def - no ghosts.
-    uint64_t uniqEv = 0, uniqNotes = 0;
-    for (const Def& d : defs) {
-        uniqEv += d.count;
-        for (size_t k = d.srcBegin; k < d.srcEnd; ++k) {
-            const Event& e = d.src->at(k);
-            uniqNotes += e.stack ? e.stack : 1;
+    uint64_t uniqEv = 0, uniqNotes = 0, nRefs = 0;
+    for (const auto& kv : winDefs)
+        for (const DefRef& r : kv.second) {
+            ++nRefs;
+            uniqEv += defs[r.def].count;
+            for (size_t k = r.srcBegin; k < r.srcEnd; ++k) {
+                const Event& e = r.src->at(k);
+                uniqNotes += e.stack ? e.stack : 1;
+            }
         }
-    }
+    std::fprintf(stderr, "[raidflp] defs prebuilt: %zu canonical, %llu instances\n",
+                 defs.size(), (unsigned long long)nRefs);
 
     // ---- pattern section --------------------------------------------------
     Buf pb;
@@ -1688,19 +2005,21 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
     // overlap: single-clip groups keep pattern-instance ops, overlapping
     // groups merge into one time-sorted literal run (events interleave exactly
     // like the arrangement plays them).
-    std::vector<const std::vector<uint32_t>*> segIds(segs.size(), nullptr);
+    std::fprintf(stderr, "[raidflp] %zu segs, %zu canonical defs\n", segs.size(), defs.size());
+    std::vector<const std::vector<DefRef>*> segIds(segs.size(), nullptr);
     std::vector<int64_t> segEndUs(segs.size(), 0);
     std::vector<size_t> active;
     for (size_t i = 0; i < segs.size(); ++i) {
         const Seg& s = segs[i];
-        const std::vector<uint32_t>* ids = defsFor(s);
+        const std::vector<DefRef>* ids = defsFor(s);
         if (!ids || ids->empty()) continue;
         segIds[i] = ids;
-        // Absolute end = base - lo + last local event time of each block.
+        // Absolute end of the seg's events: base - lo + each block's local
+        // [originUs, originUs+spanUs). Used to prune segs past a group's span.
         int64_t end = s.baseUs - s.loUs;
-        for (uint32_t id : *ids) {
-            const Def& d = defs[id];
-            end = std::max(end, s.baseUs - s.loUs + d.originUs + int64_t(d.spanUs));
+        for (const DefRef& r : *ids) {
+            const Def& d = defs[r.def];
+            end = std::max(end, s.baseUs - s.loUs + r.originUs + int64_t(d.spanUs));
         }
         segEndUs[i] = end;
         active.push_back(i);
@@ -1723,9 +2042,9 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
         chunks.push_back(ChunkOut{});
     };
 
-    auto emitInstance = [&](const Seg& s, uint32_t id) {
-        const Def& d = defs[id];
-        const int64_t anchor = s.baseUs - s.loUs + d.originUs;
+    auto emitInstance = [&](const Seg& s, const DefRef& r) {
+        const Def& d = defs[r.def];
+        const int64_t anchor = s.baseUs - s.loUs + r.originUs;
         for (;;) {
             ChunkOut& ch = chunks.back();
             const size_t room = opt.chunkEvents - std::min<uint64_t>(ch.expanded, opt.chunkEvents);
@@ -1734,7 +2053,7 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
                     ch.firstEvent = expandedTotal;
                     ch.firstTimeUs = anchor;
                 }
-                writeInst(ch.payload, id, 1, anchor, 0, d.originLane);
+                writeInst(ch.payload, r.def, 1, anchor, 0, r.originLane);
                 ch.opCount++;
                 ch.expanded += d.count;
                 ch.lastTimeUs = anchor + int64_t(d.spanUs);
@@ -1752,11 +2071,11 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
     // One op-4 per def covering `copies` evenly spaced placements of the
     // same segment: copy r anchors strideUs after the previous one. Used
     // for runs of identical non-overlapping clips (pattern stacks).
-    auto emitBurst = [&](const Seg& s, const std::vector<uint32_t>& ids,
+    auto emitBurst = [&](const Seg& s, const std::vector<DefRef>& ids,
                          uint32_t copies, int64_t strideUs) {
-        for (uint32_t id : ids) {
-            const Def& d = defs[id];
-            int64_t anchor = s.baseUs - s.loUs + d.originUs;
+        for (const DefRef& r : ids) {
+            const Def& d = defs[r.def];
+            int64_t anchor = s.baseUs - s.loUs + r.originUs;
             uint32_t left = copies;
             while (left) {
                 ChunkOut& ch = chunks.back();
@@ -1772,7 +2091,7 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
                     ch.firstEvent = expandedTotal;
                     ch.firstTimeUs = anchor;
                 }
-                writeBurst(ch.payload, id, use, anchor, 0, d.originLane, strideUs);
+                writeBurst(ch.payload, r.def, use, anchor, 0, r.originLane, strideUs);
                 ch.opCount++;
                 ch.expanded += uint64_t(use) * d.count;
                 ch.lastTimeUs = anchor + int64_t(use - 1) * strideUs + int64_t(d.spanUs);
@@ -1788,6 +2107,7 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
         }
     };
 
+    std::fprintf(stderr, "[raidflp] %zu active segs\n", active.size());
     // Maximal overlap-connected groups over the active segment list.
     struct Grp { size_t b = 0, e = 0; };
     std::vector<Grp> groups;
@@ -1801,6 +2121,7 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
         groups.push_back({g, h});
         g = h;
     }
+    std::fprintf(stderr, "[raidflp] %zu groups\n", groups.size());
 
     auto sameSeg = [](const Seg& a, const Seg& b) {
         return a.pattern == b.pattern && a.rotShift == b.rotShift &&
@@ -1808,6 +2129,8 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
     };
 
     for (size_t gi = 0; gi < groups.size(); ++gi) {
+        if ((gi & 0x3FF) == 0)
+            std::fprintf(stderr, "[raidflp] group %zu/%zu\n", gi, groups.size());
         const size_t g = groups[gi].b, h = groups[gi].e;
         if (h - g == 1) {
             const size_t ai = active[g];
@@ -1833,78 +2156,117 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
                 gi = nj - 1;
                 continue;
             }
-            for (uint32_t id : *segIds[ai]) emitInstance(segs[ai], id);
+            for (const DefRef& r : *segIds[ai]) emitInstance(segs[ai], r);
         } else {
             // Overlapping segments: merge their in-window events by absolute
             // time and store them as literal runs.
-            std::vector<Event> merged;
+            // Overlapping segments: STREAM-merge their in-window events by
+            // absolute time instead of materializing `merged`. A min-heap
+            // over per-seg cursors yields exactly the order the old
+            // stable_sort produced (timeUs, then segment order, then stream
+            // position), feeds chunkEvents-sized windows, and records which
+            // (seg, def-block) contributed to each window — memory stays
+            // O(chunks + active segs), never O(group events).
+            struct SStream {
+                const std::vector<Event>* ev = nullptr;
+                size_t n0 = 0, n1 = 0;     // window [n0, n1) inside ev
+                int64_t shift = 0;        // seg-local -> absolute
+                const std::vector<DefRef>* ids = nullptr;  // block refs, in order
+                std::vector<GroupEntry> ge;  // per-def templates (no window yet)
+            };
+            std::vector<SStream> ss;
+            ss.reserve(h - g);
             for (size_t x = g; x < h; ++x) {
-                const Seg& s = segs[active[x]];
+                const size_t ai = active[x];
+                const Seg& s = segs[ai];
                 const std::vector<Event>* ev =
                     s.rotShift >= 0 ? rotSrc(s.pattern, s.rotShift) : eventsFor(s.pattern);
                 if (!ev) continue;
-                const int64_t shift = s.baseUs - s.loUs;  // seg-local -> absolute
                 size_t n0 = 0, n1 = 0;
                 windowRange(*ev, s.loUs, s.hiUs, n0, n1);
-                merged.reserve(merged.size() + (n1 - n0));
-                for (size_t k = n0; k < n1; ++k) {
-                    Event e2 = ev->at(k);
-                    e2.timeUs += shift;
-                    merged.push_back(e2);
+                if (n1 <= n0) continue;
+                SStream st;
+                st.ev = ev;
+                st.n0 = n0;
+                st.n1 = n1;
+                st.shift = s.baseUs - s.loUs;
+                st.ids = segIds[ai];
+                st.ge.reserve(st.ids->size());
+                for (const DefRef& r : *st.ids) {
+                    GroupEntry t;
+                    t.patternId = r.def;
+                    t.anchorUs = st.shift + r.originUs;
+                    t.laneDelta = r.originLane;
+                    st.ge.push_back(t);
                 }
+                ss.push_back(std::move(st));
             }
-            std::stable_sort(merged.begin(), merged.end(),
-                             [](const Event& a, const Event& b) { return a.timeUs < b.timeUs; });
-            // The merged timeline still decides chunk windows (index time
-            // ranges must not overlap), but instead of literal runs each
-            // window becomes an op-3 group: every pattern table with events
-            // inside it plays at once. Patterns stay separate defs â€” no
-            // merged duplicates in the file.
-            size_t pos = 0;
-            while (pos < merged.size()) {
+            if (ss.empty()) continue;
+            // Min-heap on (timeUs, seg order, stream index) reproduces the
+            // old stable_sort order exactly: ties go to the earlier segment,
+            // then the earlier event in that segment's window.
+            struct HNode { int64_t t; uint32_t s, k; };
+            struct HCmp {
+                bool operator()(const HNode& a, const HNode& b) const {
+                    return a.t > b.t || (a.t == b.t && (a.s > b.s || (a.s == b.s && a.k > b.k)));
+                }
+            };
+            std::priority_queue<HNode, std::vector<HNode>, HCmp> pq;
+            for (uint32_t i = 0; i < ss.size(); ++i)
+                pq.push({ss[i].ev->at(ss[i].n0).timeUs + ss[i].shift, i, uint32_t(ss[i].n0)});
+            // Per-seg "current def block" stamps: blkWin[s] == window counter
+            // means blkIdx[s] is the block that last contributed this window.
+            // Def blocks are contiguous kFlpBlockEvents slices of [n0, n1) in
+            // id order, so a stream position k maps to block (k - n0)/K.
+            std::vector<uint64_t> blkWin(ss.size(), 0);
+            std::vector<uint32_t> blkIdx(ss.size(), 0);
+            std::vector<std::pair<uint32_t, uint32_t>> contrib;
+            uint64_t winIdx = 0;
+            while (!pq.empty()) {
                 ChunkOut& ch = chunks.back();
                 const size_t room = opt.chunkEvents - std::min<uint64_t>(ch.expanded, opt.chunkEvents);
                 if (room == 0) { sealChunk(); continue; }
-                size_t take = std::min(room, merged.size() - pos);
-                // A time window cannot split events sharing one timestamp:
-                // grow the take to cover the whole same-time run.
-                while (pos + take < merged.size() &&
-                       merged[pos + take].timeUs == merged[pos + take - 1].timeUs)
-                    ++take;
-                const int64_t winLo = merged[pos].timeUs;
-                const int64_t winHi = pos + take < merged.size()
-                                          ? merged[pos + take].timeUs
-                                          : INT64_MAX;
-                // Every def with at least one event in [winLo, winHi).
-                std::vector<GroupEntry> ents;
-                for (size_t x = g; x < h; ++x) {
-                    const size_t ai = active[x];
-                    const Seg& s = segs[ai];
-                    const int64_t shift = s.baseUs - s.loUs;
-                    for (uint32_t id : *segIds[ai]) {
-                        const Def& d = defs[id];
-                        const int64_t loLocal = winLo - shift;
-                        const int64_t hiLocal = winHi - shift;
-                        const std::vector<Event>& ev = *d.src;
-                        const auto lb = std::lower_bound(
-                            ev.begin() + std::ptrdiff_t(d.srcBegin),
-                            ev.begin() + std::ptrdiff_t(d.srcEnd), loLocal,
-                            [](const Event& e, int64_t t) { return e.timeUs < t; });
-                        const auto ub = std::lower_bound(
-                            ev.begin() + std::ptrdiff_t(d.srcBegin),
-                            ev.begin() + std::ptrdiff_t(d.srcEnd), hiLocal,
-                            [](const Event& e, int64_t t) { return e.timeUs < t; });
-                        if (lb == ub) continue;
-                        GroupEntry ge;
-                        ge.patternId = id;
-                        ge.anchorUs = shift + d.originUs;
-                        ge.laneDelta = d.originLane;
-                        ge.winLoUs = winLo;
-                        ge.winHiUs = winHi;
-                        ents.push_back(ge);
+                ++winIdx;
+                const int64_t winLo = pq.top().t;
+                contrib.clear();
+                uint64_t take = 0, pNotes = 0, oNotes = 0;
+                int64_t lastT = winLo;
+                // Emit `room` events, then keep going while the next event
+                // shares the last emitted timestamp (same-time run rule —
+                // a window may never split events at one instant).
+                for (;;) {
+                    if (pq.empty()) break;
+                    const HNode n = pq.top();
+                    pq.pop();
+                    SStream& st = ss[n.s];
+                    const Event& e = st.ev->at(n.k);
+                    lastT = e.timeUs + st.shift;
+                    const uint32_t blk = uint32_t((n.k - st.n0) / kFlpBlockEvents);
+                    if (blkWin[n.s] != winIdx || blkIdx[n.s] != blk) {
+                        blkWin[n.s] = winIdx;
+                        blkIdx[n.s] = blk;
+                        contrib.emplace_back(n.s, blk);
                     }
+                    if (e.side == 1) ++pNotes; else ++oNotes;
+                    ++take;
+                    const size_t nk = n.k + 1;
+                    if (nk < st.n1)
+                        pq.push({st.ev->at(nk).timeUs + st.shift, n.s, uint32_t(nk)});
+                    if (take >= room && (pq.empty() || pq.top().t != lastT)) break;
                 }
-                if (ents.empty()) { pos += take; continue; }  // cannot happen
+                const int64_t winHi = pq.empty() ? INT64_MAX : pq.top().t;
+                // Emit group entries in segment-then-def order (same order
+                // the old per-window seg scan produced).
+                std::sort(contrib.begin(), contrib.end());
+                std::vector<GroupEntry> ents;
+                ents.reserve(contrib.size());
+                for (const auto& [s, blk] : contrib) {
+                    GroupEntry ge = ss[s].ge[blk];
+                    ge.winLoUs = winLo;
+                    ge.winHiUs = winHi;
+                    ents.push_back(ge);
+                }
+                if (ents.empty()) continue;  // cannot happen; matches old skip
                 if (ch.opCount == 0) {
                     ch.firstEvent = expandedTotal;
                     ch.firstTimeUs = winLo;
@@ -1912,13 +2274,12 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
                 writeGroupOp(ch.payload, ents.data(), ents.size());
                 ch.opCount++;
                 ch.expanded += uint32_t(take);
-                ch.lastTimeUs = merged[pos + take - 1].timeUs;
-                for (size_t k = pos; k < pos + take; ++k)
-                    if (merged[k].side == 1) ++playerNotes; else ++opponentNotes;
+                ch.lastTimeUs = lastT;
+                playerNotes += pNotes;
+                opponentNotes += oNotes;
                 expandedTotal += take;
                 literalEvents += take;
                 maxEndUs = std::max(maxEndUs, ch.lastTimeUs);
-                pos += take;
                 if (ch.expanded >= opt.chunkEvents) sealChunk();
             }
         }
@@ -1933,6 +2294,8 @@ bool writeRaidFlp(const std::string& path, const FlpProject& project,
     // ---- meta -------------------------------------------------------------
     Chart meta;
     meta.title = project.title;
+    meta.opponent = std::string(opponentName);
+    meta.player = std::string(playerName);
     meta.keys = 4;
     meta.speed = std::min(6.0, std::max(0.5, bpm / 50.0));
     meta.tempo.push_back({0.0, bpm, 0.0});
@@ -1993,6 +2356,7 @@ struct Reader::Impl {
     FILE* f_ = nullptr;
     std::string path_;
     Info info_;
+    uint64_t fileSize_ = 0;   // total file size, cached by readHeader
     std::vector<ChunkEnt> chunks_;
     // meta / pattern section locations (lazy)
     uint64_t metaOff_ = 0, metaStored_ = 0, metaRaw_ = 0;
@@ -2011,8 +2375,16 @@ struct Reader::Impl {
     std::mutex ioMutex_;
     std::mutex cacheMutex_;
     std::vector<Cached> cache_;
+    // chunk index -> cache_ slot: lookups must not scan the whole LRU —
+    // at high chunk counts every pump/worker decode was O(cache size)
+    // under this mutex. All accesses hold cacheMutex_.
+    std::unordered_map<size_t, size_t> cachePos_;
     uint64_t cacheStamp_ = 0;
     uint64_t cacheEvents_ = 0, cacheCapEvents_ = 0;
+    // Instrumentation for density benchmarking: chunk queries that hit or
+    // missed the LRU, actual chunk decodes, and raw payload bytes decoded.
+    std::atomic<uint64_t> cacheHits_{0}, cacheMisses_{0};
+    std::atomic<uint64_t> chunkDecodes_{0}, bytesDecoded_{0};
 
     Semaphore decSem_;
     int decTotal_ = 2;
@@ -2109,6 +2481,7 @@ struct Reader::Impl {
         if (fseeko(f_, 0, SEEK_END)) { err = "cannot seek"; return false; }
         const uint64_t fileSize = uint64_t(ftello(f_));
 #endif
+        fileSize_ = fileSize;
         if (indexOff > fileSize || indexSize > fileSize - indexOff ||
             metaOff_ > fileSize || patOff_ > fileSize) {
             err = "raid sections outside file";
@@ -2122,28 +2495,48 @@ struct Reader::Impl {
             if (fseeko(f_, off_t(indexOff), SEEK_SET)) { err = "cannot seek"; return false; }
 #endif
         }
-        std::vector<char> idx(indexSize);
-        {
-            std::lock_guard<std::mutex> lk(ioMutex_);
-            if (indexSize && std::fread(idx.data(), 1, indexSize, f_) != indexSize) {
-                err = "cannot read chunk index";
-                return false;
-            }
-        }
-        Cur ic{idx.data(), idx.data() + idx.size()};
+        // Stream the index through a small block buffer instead of
+        // materializing indexSize bytes: open-time peak stays O(block),
+        // which matters at E404C scale (~1.4M chunks -> ~78 MiB index).
         chunks_.resize(size_t(info_.chunkCount));
-        for (auto& e : chunks_) {
-            e.firstEvent = ic.u64();
-            e.firstTimeUs = ic.i64();
-            e.lastTimeUs = ic.i64();
-            e.offset = ic.u64();
-            e.storedSize = uint32_t(ic.u32());
-            e.rawSize = uint32_t(ic.u32());
-            e.expanded = uint32_t(ic.u32());
-            e.opCount = uint32_t(ic.u32());
-            e.crc = uint32_t(ic.u32());
-            e.flags = uint32_t(ic.u32());
-            if (!ic.ok) { err = "truncated chunk index"; return false; }
+        {
+            constexpr size_t kIdxBlock = 1 << 20;
+            std::vector<char> blk(kIdxBlock);
+            size_t bpos = 0, blen = 0;
+            bool idxEof = false;
+            auto idxByte = [&]() -> int {
+                if (bpos == blen) {
+                    bpos = 0;
+                    blen = std::fread(blk.data(), 1, blk.size(), f_);
+                    if (blen == 0) { idxEof = true; return -1; }
+                }
+                return uint8_t(blk[bpos++]);
+            };
+            auto idxU32 = [&]() -> uint32_t {
+                uint32_t v = 0;
+                for (int s = 0; s < 4; ++s) {
+                    const int c = idxByte();
+                    if (c < 0) return 0;
+                    v |= uint32_t(c) << (8 * s);
+                }
+                return v;
+            };
+            auto idxU64 = [&]() -> uint64_t {
+                return uint64_t(idxU32()) | (uint64_t(idxU32()) << 32);
+            };
+            for (auto& e : chunks_) {
+                e.firstEvent = idxU64();
+                e.firstTimeUs = int64_t(idxU64());
+                e.lastTimeUs = int64_t(idxU64());
+                e.offset = idxU64();
+                e.storedSize = idxU32();
+                e.rawSize = idxU32();
+                e.expanded = idxU32();
+                e.opCount = idxU32();
+                e.crc = idxU32();
+                e.flags = idxU32();
+            }
+            if (idxEof) { err = "cannot read chunk index"; return false; }
         }
         // The index must describe a real chunk sequence: every chunk expands to
         // a bounded number of events, times are sane, offsets point inside the
@@ -2302,42 +2695,226 @@ struct Reader::Impl {
         return true;
     }
 
+    // cacheMutex_ must be held. cacheFind is O(1); cacheStore keeps the
+    // LRU bounded by event count (the entry ceiling is generous — the
+    // event budget is the real memory bound; a small entry cap defeats
+    // prefetch when chunks are tiny) and maintains cachePos_.
+    Cached* cacheFind(size_t i) {
+        auto it = cachePos_.find(i);
+        return it == cachePos_.end() ? nullptr : &cache_[it->second];
+    }
+    void cacheRemoveAt(size_t pos) {
+        const size_t victim = cache_[pos].index;
+        cacheEvents_ -= cache_[pos].events.size();
+        const size_t last = cache_.size() - 1;
+        if (pos != last) {
+            cache_[pos] = std::move(cache_[last]);
+            cachePos_[cache_[pos].index] = pos;
+        }
+        cache_.pop_back();
+        cachePos_.erase(victim);
+    }
+    void cacheStore(Cached&& c) {
+        while (!cache_.empty() &&
+               (cache_.size() >= 8192 || cacheEvents_ + c.events.size() > cacheCapEvents_)) {
+            auto oldest = std::min_element(cache_.begin(), cache_.end(),
+                                           [](const Cached& a, const Cached& b) { return a.stamp < b.stamp; });
+            cacheRemoveAt(size_t(oldest - cache_.begin()));
+        }
+        cachePos_[c.index] = cache_.size();
+        cacheEvents_ += c.events.size();
+        cache_.push_back(std::move(c));
+    }
+
     // LRU-cached chunk decode; safe to call from any thread.
     bool chunkEvents(size_t i, std::vector<Event>& out, std::string& err) {
         if (i >= chunks_.size()) { err = "chunk index out of range"; return false; }
         {
             std::lock_guard<std::mutex> lk(cacheMutex_);
-            for (auto& c : cache_)
-                if (c.index == i) {
-                    out.insert(out.end(), c.events.begin(), c.events.end());
-                    c.stamp = ++cacheStamp_;
-                    return true;
-                }
+            if (Cached* hit = cacheFind(i)) {
+                out.insert(out.end(), hit->events.begin(), hit->events.end());
+                hit->stamp = ++cacheStamp_;
+                cacheHits_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
         }
         Cached c;
         c.index = i;
         c.stamp = ++cacheStamp_;
+        cacheMisses_.fetch_add(1, std::memory_order_relaxed);
+        chunkDecodes_.fetch_add(1, std::memory_order_relaxed);
+        bytesDecoded_.fetch_add(chunks_[i].rawSize, std::memory_order_relaxed);
         if (!decodeChunk(chunks_[i], c.events, err)) return false;
         out.insert(out.end(), c.events.begin(), c.events.end());
         {
             std::lock_guard<std::mutex> lk(cacheMutex_);
             // Another thread may have cached this chunk while we decoded.
-            for (auto& e : cache_)
-                if (e.index == i) return true;
-            // Bound the cache by event count, not just entry count: evict LRU
-            // until the new chunk fits the memory budget.
-            while (!cache_.empty() &&
-                   (cache_.size() >= 8 || cacheEvents_ + c.events.size() > cacheCapEvents_)) {
-                auto oldest = std::min_element(cache_.begin(), cache_.end(),
-                                               [](const Cached& a, const Cached& b) { return a.stamp < b.stamp; });
-                cacheEvents_ -= oldest->events.size();
-                *oldest = std::move(cache_.back());
-                cache_.pop_back();
-            }
-            cacheEvents_ += c.events.size();
-            cache_.push_back(std::move(c));
+            if (cacheFind(i)) return true;
+            cacheStore(std::move(c));
         }
         return true;
+    }
+
+    // Cache-warming decode: identical to chunkEvents but never copies the
+    // events out — prefetch only needs the LRU side effect, and the copy
+    // used to double every prefetched chunk's memory.
+    bool warmChunk(size_t i, std::string& err) {
+        if (i >= chunks_.size()) { err = "chunk index out of range"; return false; }
+        {
+            std::lock_guard<std::mutex> lk(cacheMutex_);
+            if (Cached* hit = cacheFind(i)) {
+                hit->stamp = ++cacheStamp_;
+                cacheHits_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
+        Cached c;
+        c.index = i;
+        c.stamp = ++cacheStamp_;
+        cacheMisses_.fetch_add(1, std::memory_order_relaxed);
+        chunkDecodes_.fetch_add(1, std::memory_order_relaxed);
+        bytesDecoded_.fetch_add(chunks_[i].rawSize, std::memory_order_relaxed);
+        if (!decodeChunk(chunks_[i], c.events, err)) return false;
+        {
+            std::lock_guard<std::mutex> lk(cacheMutex_);
+            if (cacheFind(i)) return true;
+            cacheStore(std::move(c));
+        }
+        return true;
+    }
+
+    // Decodes chunk i and appends only the events inside [startUs, endUs)
+    // (with global indices) to out. Cache hits filter the stored vector
+    // directly — no intermediate whole-chunk copy like range() used to make.
+    bool rangeChunk(size_t i, int64_t startUs, int64_t endUs,
+                    std::vector<Event>& out, std::vector<uint64_t>* indices,
+                    std::string& err) {
+        if (i >= chunks_.size()) { err = "chunk index out of range"; return false; }
+        const uint64_t base = chunks_[i].firstEvent;
+        {
+            std::lock_guard<std::mutex> lk(cacheMutex_);
+            if (Cached* hit = cacheFind(i)) {
+                for (size_t k = 0; k < hit->events.size(); ++k) {
+                    const Event& e = hit->events[k];
+                    if (e.timeUs >= endUs) break;
+                    if (e.timeUs >= startUs) {
+                        out.push_back(e);
+                        if (indices) indices->push_back(base + k);
+                    }
+                }
+                hit->stamp = ++cacheStamp_;
+                cacheHits_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
+        Cached c;
+        c.index = i;
+        c.stamp = ++cacheStamp_;
+        cacheMisses_.fetch_add(1, std::memory_order_relaxed);
+        chunkDecodes_.fetch_add(1, std::memory_order_relaxed);
+        bytesDecoded_.fetch_add(chunks_[i].rawSize, std::memory_order_relaxed);
+        if (!decodeChunk(chunks_[i], c.events, err)) return false;
+        for (size_t k = 0; k < c.events.size(); ++k) {
+            const Event& e = c.events[k];
+            if (e.timeUs >= endUs) break;
+            if (e.timeUs >= startUs) {
+                out.push_back(e);
+                if (indices) indices->push_back(base + k);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(cacheMutex_);
+            if (cacheFind(i)) return true;  // another thread cached it
+            cacheStore(std::move(c));
+        }
+        return true;
+    }
+
+    // Window-sliced chunk decode: emits only events with timeUs in
+    // [qLo,qHi) plus each event's index in the chunk's FULL output sequence
+    // (identical to what rangeChunk assigns on a cache miss). `produced`
+    // still accounts every format-kept event, so the declared-count trailer
+    // validates exactly like decodeChunk. Nothing is cached — the slice is
+    // not the whole chunk.
+    bool decodeChunkSliced(const ChunkEnt& e, int64_t qLo, int64_t qHi,
+                           std::vector<Event>& out, std::vector<uint64_t>& indices,
+                           std::string& err) {
+        if (e.expanded > maxChunkEvents_) {
+            err = "chunk expands beyond the memory budget";
+            return false;
+        }
+        DecodeGuard guard(decSem_);
+        std::vector<char> payload;
+        const bool compressed = (e.flags & 1) != 0;
+        if (!readSection(e.offset, compressed ? e.storedSize : 0, e.rawSize, compressed, payload, err))
+            return false;
+        if (payload.size() < 12 || crcOf(payload.data(), payload.size()) != e.crc) {
+            err = "chunk checksum mismatch";
+            return false;
+        }
+        if (!loadPatterns(err)) return false;
+
+        const size_t before = out.size(), beforeIdx = indices.size();
+        Cur cur{payload.data(), payload.data() + payload.size()};
+        Env env{&patternBlob_, &patterns_, &patHasInst_};
+        Ctx ctx{};
+        EmitOut eo{&out, 0, e.expanded, qLo, qHi, &indices, e.firstEvent};
+        if (!emitOps(cur, env, nullptr, ctx, 0, eo, err)) {
+            out.resize(before);
+            indices.resize(beforeIdx);
+            return false;
+        }
+        uint64_t declared = cur.u64();
+        if (!cur.ok || cur.p != cur.end || declared != eo.produced || eo.produced != e.expanded) {
+            out.resize(before);
+            indices.resize(beforeIdx);
+            err = "chunk event count mismatch";
+            return false;
+        }
+        return true;
+    }
+
+    // rangeWindowChunk: cache hits filter the resident chunk exactly like
+    // rangeChunk; misses decode only the requested window (no cache insert).
+    bool rangeWindowChunk(size_t i, int64_t startUs, int64_t endUs,
+                          std::vector<Event>& out, std::vector<uint64_t>& indices,
+                          std::string& err) {
+        if (i >= chunks_.size()) { err = "chunk index out of range"; return false; }
+        const uint64_t base = chunks_[i].firstEvent;
+        {
+            std::lock_guard<std::mutex> lk(cacheMutex_);
+            if (Cached* hit = cacheFind(i)) {
+                for (size_t k = 0; k < hit->events.size(); ++k) {
+                    const Event& e = hit->events[k];
+                    if (e.timeUs >= endUs) break;
+                    if (e.timeUs >= startUs) {
+                        out.push_back(e);
+                        indices.push_back(base + k);
+                    }
+                }
+                hit->stamp = ++cacheStamp_;
+                cacheHits_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
+        // Hybrid: when the query window covers most of the chunk's time
+        // span, whole-chunk decode + LRU caching is cheaper than re-slicing
+        // on every window (sequential playback). Slice only pays off for
+        // windows small relative to the chunk — huge chunks, sparse access.
+        {
+            const ChunkEnt& ce = chunks_[i];
+            const int64_t span = ce.lastTimeUs - ce.firstTimeUs;
+            const int64_t ovLo = startUs > ce.firstTimeUs ? startUs : ce.firstTimeUs;
+            const int64_t ovHi = endUs < ce.lastTimeUs ? endUs : ce.lastTimeUs;
+            const bool mostlyCovered = span > 0 &&
+                int64_t(ovHi - ovLo) * 2 >= span;
+            if (mostlyCovered)
+                return rangeChunk(i, startUs, endUs, out, &indices, err);
+        }
+        cacheMisses_.fetch_add(1, std::memory_order_relaxed);
+        chunkDecodes_.fetch_add(1, std::memory_order_relaxed);
+        bytesDecoded_.fetch_add(chunks_[i].rawSize, std::memory_order_relaxed);
+        return decodeChunkSliced(chunks_[i], startUs, endUs, out, indices, err);
     }
 };
 
@@ -2388,6 +2965,24 @@ void Reader::setMemoryBudgetBytes(uint64_t bytes) {
 
 uint64_t Reader::memoryBudgetBytes() const {
     return impl_ ? impl_->memBudget_ : memBudget_;
+}
+
+uint64_t Reader::cachedEvents() const {
+    return impl_ ? impl_->cacheEvents_ : 0;
+}
+
+uint64_t Reader::cachedEventCapacity() const {
+    return impl_ ? impl_->cacheCapEvents_ : 0;
+}
+
+void Reader::cacheStats(uint64_t& hits, uint64_t& misses,
+                        uint64_t& decodes, uint64_t& bytesDecoded) const {
+    hits = misses = decodes = bytesDecoded = 0;
+    if (!impl_) return;
+    hits = impl_->cacheHits_.load(std::memory_order_relaxed);
+    misses = impl_->cacheMisses_.load(std::memory_order_relaxed);
+    decodes = impl_->chunkDecodes_.load(std::memory_order_relaxed);
+    bytesDecoded = impl_->bytesDecoded_.load(std::memory_order_relaxed);
 }
 
 bool Reader::uniqueStats(uint64_t& events, uint64_t& notes, std::string& err) {
@@ -2441,6 +3036,66 @@ std::string Reader::metaJson() {
     return std::string(blob.data(), blob.size() - 4);
 }
 
+bool Reader::embeddedAssets(std::vector<EmbeddedAsset>& out, std::string& err) {
+    out.clear();
+    if (!impl_ || !impl_->f_) { err = "reader not open"; return false; }
+    Impl& im = *impl_;
+    const uint64_t footerPos = im.fileSize_ >= kAssetsFooterSize
+                                   ? im.fileSize_ - kAssetsFooterSize : 0;
+    if (footerPos < kHeaderSize) return true;  // too small to hold a trailer
+    std::vector<char> foot;
+    if (!im.readRaw(footerPos, kAssetsFooterSize, foot, err)) return false;
+    if (std::memcmp(foot.data(), kAssetsMagic, 8) != 0) return true;  // no trailer
+    Cur fc{foot.data(), foot.data() + foot.size()};
+    fc.skip(8);
+    const uint64_t aoff = fc.u64();
+    const uint32_t acrc = uint32_t(fc.u32());
+    const uint32_t blobVersion = uint32_t(fc.u32());  // footer reserved
+    if (!fc.ok || aoff < kHeaderSize || aoff > footerPos || blobVersion > 1) {
+        err = "bad assets trailer";
+        return false;
+    }
+    std::vector<char> blob;
+    if (!im.readRaw(aoff, footerPos - aoff, blob, err)) return false;
+    if (blob.size() < 4 || crcOf(blob.data(), blob.size()) != acrc) {
+        err = "assets checksum mismatch";
+        return false;
+    }
+    Cur bc{blob.data(), blob.data() + blob.size()};
+    const uint32_t count = bc.u32();
+    if (count > kMaxEmbeddedAssets) { err = "absurd asset count"; return false; }
+    for (uint32_t i = 0; i < count; ++i) {
+        EmbeddedAsset a;
+        if (blobVersion) {
+            const uint8_t type = bc.u8();
+            if (!bc.ok || type > 1) { err = "bad assets trailer"; return false; }
+            a.reference = type == 1;
+        }
+        const uint32_t nameLen = bc.u32();
+        if (!bc.ok || nameLen > 4096 || size_t(bc.end - bc.p) < nameLen) {
+            err = "bad assets trailer";
+            return false;
+        }
+        a.name.assign(bc.p, bc.p + nameLen);
+        bc.p += nameLen;
+        const uint64_t dataSize = bc.u64();
+        const uint64_t cap = a.reference ? 4096 : kMaxAssetBytes;
+        if (!bc.ok || dataSize > cap || uint64_t(bc.end - bc.p) < dataSize) {
+            err = "bad assets trailer";
+            return false;
+        }
+        if (a.reference) {
+            a.refPath.assign(bc.p, bc.p + dataSize);
+        } else {
+            a.data.assign(bc.p, bc.p + dataSize);
+        }
+        bc.p += dataSize;
+        out.push_back(std::move(a));
+    }
+    if (!bc.ok || bc.p != bc.end) { err = "bad assets trailer"; return false; }
+    return true;
+}
+
 int64_t Reader::chunkAtOrBefore(int64_t timeUs) const {
     if (!impl_ || impl_->chunks_.empty()) return -1;
     const auto& chunks = impl_->chunks_;
@@ -2470,21 +3125,27 @@ bool Reader::range(int64_t startUs, int64_t endUs, std::vector<Event>& out,
         size_t mid = (lo + hi) / 2;
         if (chunks[mid].lastTimeUs >= startUs) hi = mid; else lo = mid + 1;
     }
-    std::vector<Event> buf;
-    for (size_t i = lo; i < chunks.size() && chunks[i].firstTimeUs < endUs; ++i) {
-        buf.clear();
-        if (!im.chunkEvents(i, buf, err)) return false;
-        // buf holds the chunk's expanded events in order: position k has the
-        // global index chunks[i].firstEvent + k.
-        for (size_t k = 0; k < buf.size(); ++k) {
-            const Event& e = buf[k];
-            if (e.timeUs >= endUs) break;
-            if (e.timeUs >= startUs) {
-                out.push_back(e);
-                if (indices) indices->push_back(chunks[i].firstEvent + k);
-            }
-        }
+    for (size_t i = lo; i < chunks.size() && chunks[i].firstTimeUs < endUs; ++i)
+        if (!im.rangeChunk(i, startUs, endUs, out, indices, err)) return false;
+    return true;
+}
+
+bool Reader::rangeWindow(int64_t startUs, int64_t endUs, std::vector<Event>& out,
+                         std::vector<uint64_t>& indices, std::string& err) {
+    // Same chunk walk as range(), but cache misses decode only the requested
+    // window instead of materializing the whole chunk. Returned indices are
+    // identical to range()'s — positions in each chunk's full output.
+    if (!impl_) { err = "not open"; return false; }
+    Impl& im = *impl_;
+    if (endUs <= startUs || im.chunks_.empty()) return true;
+    const auto& chunks = im.chunks_;
+    size_t lo = 0, hi = chunks.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (chunks[mid].lastTimeUs >= startUs) hi = mid; else lo = mid + 1;
     }
+    for (size_t i = lo; i < chunks.size() && chunks[i].firstTimeUs < endUs; ++i)
+        if (!im.rangeWindowChunk(i, startUs, endUs, out, indices, err)) return false;
     return true;
 }
 
@@ -2524,6 +3185,27 @@ std::future<bool> Reader::chunkEventsAsync(size_t i, std::vector<Event>* out) {
     return std::async(std::launch::async, [im, i, out]() {
         std::string err;
         return im->chunkEvents(i, *out, err);
+    });
+}
+
+std::future<bool> Reader::warmChunkAsync(size_t i) {
+    std::shared_ptr<Impl> im = impl_;
+    if (!im) return std::async(std::launch::deferred, [] { return false; });
+    return std::async(std::launch::async, [im, i]() {
+        std::string err;
+        return im->warmChunk(i, err);
+    });
+}
+
+std::future<bool> Reader::warmChunksAsync(size_t first, size_t last) {
+    std::shared_ptr<Impl> im = impl_;
+    if (!im || last <= first) return std::async(std::launch::deferred, [] { return false; });
+    return std::async(std::launch::async, [im, first, last]() {
+        bool ok = true;
+        std::string err;
+        for (size_t i = first; i < last; ++i)
+            ok = im->warmChunk(i, err) && ok;
+        return ok;
     });
 }
 

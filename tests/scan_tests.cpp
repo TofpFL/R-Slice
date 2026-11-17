@@ -866,6 +866,58 @@ void testFlStudio() {
         fs::remove(bp);
     }
 
+    // Canonical dedup: two patterns with identical note content share one
+    // pattern-table def however their playlist windows differ; a pattern
+    // differing by one pitch stays distinct. Instances keep per-clip
+    // anchors, so decoded events are unchanged.
+    {
+        FlpProject pd;
+        pd.bpm = 120;
+        pd.ppqn = 96;
+        pd.chartChannel = 7;
+        for (int num : {1, 2}) {
+            FlpPattern pat;
+            pat.number = num;
+            pat.lengthTicks = 384;
+            pat.notes.push_back({0, 48, 60, 7, 100, 0});
+            pat.notes.push_back({192, 48, 62, 7, 100, 0});
+            pd.patterns.push_back(pat);
+        }
+        FlpPattern p3;
+        p3.number = 3;
+        p3.lengthTicks = 384;
+        p3.notes.push_back({0, 48, 60, 7, 100, 0});
+        p3.notes.push_back({192, 48, 64, 7, 100, 0});  // different pitch: distinct
+        pd.patterns.push_back(p3);
+        pd.playlist.push_back({1, 0, 0, 384, 0, false});
+        pd.playlist.push_back({2, 0, 384, 384, 0, false});
+        pd.playlist.push_back({3, 0, 768, 384, 0, false});
+        raid::Info di;
+        const fs::path dp = fs::temp_directory_path() / "gh_flp_dedup.raid";
+        SCHECK(raid::writeRaidFlp(str(dp), pd, raid::EncodeOptions{}, &di, err));
+        SCHECK(di.patternCount == 2);  // pat1+pat2 share one def, pat3 its own
+        SCHECK(di.logicalEvents == 6);
+        raid::Reader drd;
+        SCHECK(drd.open(str(dp), err));
+        std::vector<raid::Event> de;
+        SCHECK(drd.range(0, 10000000, de, err));
+        SCHECK(de.size() == 6);
+        if (de.size() == 6) {
+            // 384-tick clips at 120 BPM/96 ppqn: 2,000,000 us apart; each
+            // pattern's notes at +0 and +1,000,000 us inside its clip.
+            for (int k = 0; k < 3; ++k) {
+                SCHECK(de[2 * k].timeUs == int64_t(k) * 2000000);
+                SCHECK(de[2 * k + 1].timeUs == int64_t(k) * 2000000 + 1000000);
+            }
+            // pat3 shares pat1's first note (pitch 60) but its second note
+            // differs (pitch 64 vs 62 -> different pitch%4 lane).
+            SCHECK(de[4].lane == de[0].lane);
+            SCHECK(de[5].lane != de[1].lane);
+        }
+        drd.close();
+        fs::remove(dp);
+    }
+
     // A 4/16 project: the beat is a 16th note, so timing scales x4.
     FlpProject ps;
     SCHECK(readFlp(makeFlpSig16(), ps, err));

@@ -57,4 +57,11 @@ struct VideoSource {
 };
 VideoSource findVideo(const scene::Files& files, const std::string& name, const std::string& baseDir);
 
+// Arbitrary-path variant for --vchart: returns a directly playable .mpg
+// path, converting other containers once through ffmpeg into
+// <userDir>/cache/videos/. Empty string + err on failure. Synchronous —
+// the result is cached, so repeat runs are instant.
+std::string ensurePlayableVideo(const std::string& path, const std::string& userDir,
+                                std::string& err);
+
 }  // namespace gh

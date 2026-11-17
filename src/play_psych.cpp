@@ -13,6 +13,7 @@
 #include "effects.hpp"
 #include "platform.hpp"
 #include "psych_ui.hpp"
+#include "raid.hpp"
 #include "rchr.hpp"
 #include "state_play.hpp"
 #include "rlgl.h"
@@ -413,6 +414,92 @@ bool PlayState::setupPsych() {
         std::vector<std::string> scan = roots;
         scan.insert(scan.end(), shared.begin(), shared.end());
         const std::string cache = a.userDir + "rchr/";
+        // .raid charts can carry .rchr packs: embedded bytes are materialized
+        // into the rchr drop dir as real files, while external references
+        // (v2 trailer records) are resolved to files on disk and mounted
+        // directly. The scan below mounts them exactly like loose packs.
+        // Filenames are content-keyed so different songs' packs never
+        // collide in the cache.
+        size_t cidx = entry_->chartPaths.size();
+        for (size_t i = 0; i < entry_->diffs.size() && i < entry_->chartPaths.size(); ++i)
+            if (entry_->diffs[i] == req_.diff) { cidx = i; break; }
+        std::vector<std::string> refRoots;
+        auto resolvePackRef = [&](const std::string& ref) -> std::string {
+            std::vector<std::string> cand;
+            if (toPath(ref).is_absolute()) cand.push_back(ref);
+            cand.push_back(ref);
+            if (cidx < entry_->chartPaths.size()) {
+                const fs::path cp = toPath(entry_->chartPaths[cidx]);
+                if (cp.has_parent_path()) cand.push_back(pathStr(cp.parent_path() / ref));
+            }
+            cand.push_back(a.base + "mods/" + ref);
+            const std::string bn = ref.substr(ref.find_last_of("/\\") + 1);
+            if (bn != ref) cand.push_back(a.base + "mods/" + bn);
+            for (const std::string& s : cand) {
+                std::error_code ec2;
+                if (fs::is_regular_file(toPath(s), ec2)) return s;
+            }
+            return "";
+        };
+        {
+            if (cidx < entry_->chartPaths.size() && raid::isRaidFile(entry_->chartPaths[cidx])) {
+                raid::Reader rd;
+                std::string rerr;
+                if (rd.open(entry_->chartPaths[cidx], rerr)) {
+                    std::vector<raid::EmbeddedAsset> packs;
+                    if (rd.embeddedAssets(packs, rerr) && !packs.empty()) {
+                        const fs::path drop = toPath(cache + "drop/");
+                        std::error_code dec;
+                        fs::create_directories(drop, dec);
+                        bool added = false;
+                        for (const raid::EmbeddedAsset& pk : packs) {
+                            if (pk.reference) {
+                                const std::string rp = resolvePackRef(pk.refPath);
+                                if (rp.empty()) {
+                                    debugNotice("rchr ref " + pk.refPath + ": not found", false, false);
+                                    continue;
+                                }
+                                std::string merr2;
+                                const std::string m = rchr::mountDir(rp, cache, merr2);
+                                if (m.empty())
+                                    debugNotice("rchr " + rp + ": " + merr2, false, false);
+                                else
+                                    refRoots.push_back(m);
+                                continue;
+                            }
+                            uint64_t h = 1469598103934665603ull;
+                            for (char ch : pk.data) { h ^= uint8_t(ch); h *= 1099511628211ull; }
+                            char hex[17];
+                            std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
+                            std::string fn = pk.name;
+                            const size_t slash = fn.find_last_of("/\\");
+                            if (slash != std::string::npos) fn = fn.substr(slash + 1);
+                            for (char& ch : fn)
+                                if (!(ch >= 'a' && ch <= 'z') && !(ch >= 'A' && ch <= 'Z') &&
+                                    !(ch >= '0' && ch <= '9') && ch != '.' && ch != '-' && ch != '_')
+                                    ch = '_';
+                            if (fn.empty() || fn == ".") fn = "pack.rchr";
+                            const fs::path fp = drop / (std::string(hex) + "_" + fn);
+                            std::error_code fec;
+                            const bool stale = fs::exists(fp, fec) &&
+                                               fs::file_size(fp, fec) != pk.data.size();
+                            if (!fs::exists(fp, fec) || stale) {
+                                FILE* wf = std::fopen(pathStr(fp).c_str(), "wb");
+                                if (wf) {
+                                    if (!pk.data.empty())
+                                        std::fwrite(pk.data.data(), 1, pk.data.size(), wf);
+                                    std::fclose(wf);
+                                }
+                            }
+                            if (!added) {
+                                scan.push_back(pathStr(drop) + "/");
+                                added = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         std::set<std::string> mounted;
         for (const std::string& dir : scan) {
             std::vector<fs::path> dirs{toPath(dir)};
@@ -437,6 +524,8 @@ bool PlayState::setupPsych() {
                 if (ec) break;
             }
         }
+        for (const std::string& m : refRoots)
+            if (mounted.insert(m).second) roots.push_back(m + "/");
     }
     sc.files.setRoots(roots);
     sc.files.setSharedRoots(shared);
@@ -1292,7 +1381,10 @@ void PlayState::psychDraw() {
     scene::Scene& sc = *scene_;
     const double now = a.now;
     gfx::beginCanvas();
-    if (backdrop_) {
+    // "Video background" modifier: the video sits behind every scene sprite;
+    // it replaces the fallback stage backdrop when the song has no stage.
+    if (videoBgActive()) drawVideoBg();
+    if (backdrop_ && !videoBgActive()) {
         gfx::endCanvas();
         gfx::beginCanvas(0.94f, {640, 370});
         stage_.drawBack(now);

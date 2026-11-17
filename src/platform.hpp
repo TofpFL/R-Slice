@@ -50,6 +50,9 @@ void setWindowIcon();
 // Wait for the screen's refresh (on) or present frames as soon as they are
 // ready (off). Applied at once; Android asks EGL for it.
 void setVsync(bool on);
+// Windows: raises the OS timer resolution (~0.5 ms) so the frame pacer's
+// sleeps are precise. No-op elsewhere. Call once after window init.
+void raiseTimerResolution();
 // The player picks a folder. Desktop: the system's dialog (blocking); its
 // path comes back ("" if cancelled). Android: the system folder picker
 // opens and the files the Psych Engine interface needs are copied into

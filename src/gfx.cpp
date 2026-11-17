@@ -15,6 +15,9 @@ bool g_titleOwned = false, g_uiOwned = false, g_vcrOwned = false, g_pixelOwned =
 Texture2D g_glow{};
 Texture2D g_note[5]{};
 Texture2D g_receptor[2]{};  // arrow, diamond
+Texture2D g_receptorDir[4]{};  // HRK arrow per direction (white, tinted by caller)
+Texture2D g_holdPiece[5]{}, g_holdEnd[5]{};  // HRK sustain sprites, baked per dir
+bool g_hrk = false;
 
 Color lerpColor(Color a, Color b, float t) {
     t = saturate(t);
@@ -93,6 +96,135 @@ Font loadFont(const std::string& path, int size, bool& owned) {
     return f;
 }
 
+
+// ------------------------------------------------------------ HRK notes --
+// H-Slice's NOTE_assets-hrk atlas: note/hold sprites are RGB masks (pure
+// red/green/blue texels each select one of three palette colours, like its
+// RGBPalette shader) and the receptor arrows are plain grayscale. We bake
+// the masks into ordinary RGBA textures tinted with this game's lane colours
+// so no shader is needed. Missing files fall back to the procedural glyphs.
+
+struct HrkFrame { std::string name; Rectangle rect; };
+std::vector<HrkFrame> g_hrkFrames;
+Image g_hrkImg{};
+
+const HrkFrame* hrkFrame(const char* name) {
+    for (const HrkFrame& f : g_hrkFrames)
+        if (f.name == name) return &f;
+    return nullptr;
+}
+
+Texture2D bakeHrk(const HrkFrame& f, const Color pal[3], bool white) {
+    const int w = int(f.rect.width), h = int(f.rect.height);
+    Image out = GenImageColor(w, h, BLANK);
+    unsigned char* d = static_cast<unsigned char*>(out.data);
+    const unsigned char* s = static_cast<const unsigned char*>(g_hrkImg.data);
+    const int iw = g_hrkImg.width;
+    const int x0 = int(f.rect.x), y0 = int(f.rect.y);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const unsigned char* sp = s + ((y0 + y) * iw + (x0 + x)) * 4;
+            unsigned char* dp = d + (y * w + x) * 4;
+            dp[3] = sp[3];
+            if (white) {
+                dp[0] = dp[1] = dp[2] = 255;
+            } else {
+                // out.rgb = tex.r*pal0 + tex.g*pal1 + tex.b*pal2 (per channel)
+                const float ch[3] = {sp[0] / 255.0f, sp[1] / 255.0f, sp[2] / 255.0f};
+                const unsigned char pc[3][3] = {{pal[0].r, pal[0].g, pal[0].b},
+                                                {pal[1].r, pal[1].g, pal[1].b},
+                                                {pal[2].r, pal[2].g, pal[2].b}};
+                for (int c = 0; c < 3; ++c) {
+                    const float v = ch[0] * pc[0][c] / 255.0f + ch[1] * pc[1][c] / 255.0f +
+                                    ch[2] * pc[2][c] / 255.0f;
+                    dp[c] = (unsigned char)(std::min(1.0f, v) * 255.0f + 0.5f);
+                }
+            }
+        }
+    }
+    Texture2D t = LoadTextureFromImage(out);
+    UnloadImage(out);
+    GenTextureMipmaps(&t);
+    SetTextureFilter(t, TEXTURE_FILTER_TRILINEAR);
+    return t;
+}
+
+void loadHrk(const std::string& baseDir) {
+    const char* rel = "assets/notes/NOTE_assets-hrk";
+    const std::string relPng = std::string(rel) + ".png";
+    std::string png = baseDir + relPng;
+    if (!FileExists(png.c_str())) png = relPng;
+    if (!FileExists(png.c_str())) return;
+    Image img = LoadImage(png.c_str());
+    if (img.data == nullptr || img.format != PIXELFORMAT_UNCOMPRESSED_R8G8B8A8) {
+        if (img.data) UnloadImage(img);
+        return;
+    }
+    const std::string relXml = std::string(rel) + ".xml";
+    std::string xmlPath = baseDir + relXml;
+    if (!FileExists(xmlPath.c_str())) xmlPath = relXml;
+    char* xml = FileExists(xmlPath.c_str()) ? LoadFileText(xmlPath.c_str()) : nullptr;
+    g_hrkFrames.clear();
+    if (xml) {
+        for (const char* p = std::strstr(xml, "<SubTexture"); p; p = std::strstr(p, "<SubTexture")) {
+            const char* tagEnd = std::strstr(p, "/>");
+            if (!tagEnd) break;
+            const char* np = std::strstr(p, "name=\"");
+            if (!np || np > tagEnd) { p = tagEnd + 2; continue; }
+            np += 6;
+            const char* ne = std::strchr(np, '"');
+            if (!ne || ne > tagEnd) { p = tagEnd + 2; continue; }
+            HrkFrame f;
+            f.name.assign(np, ne - np);
+            auto attr = [&](const char* key) -> int {
+                const char* a = std::strstr(p, key);
+                if (!a || a > tagEnd) return 0;
+                return std::atoi(a + std::strlen(key));
+            };
+            f.rect = {(float)attr(" x=\""), (float)attr(" y=\""),
+                      (float)attr(" width=\""), (float)attr(" height=\"")};
+            if (f.rect.width > 0 && f.rect.height > 0) g_hrkFrames.push_back(f);
+            p = tagEnd + 2;
+        }
+        UnloadFileText(xml);
+    }
+    if (g_hrkFrames.empty()) { UnloadImage(img); return; }
+    g_hrkImg = img;
+
+    // palettes: H-Slice's arrowRGB triples (main, white highlight, dark shade)
+    // in RGB-mask order; kCenter reuses the left/purple set.
+    static const char* noteFrame[5] = {"purple0000", "blue0000", "green0000", "red0000", "purple0000"};
+    static const char* arrowFrame[4] = {"arrowLEFT0000", "arrowDOWN0000", "arrowUP0000", "arrowRIGHT0000"};
+    const Color hrkPal[5][3] = {
+        {rgb(0xC24B99), WHITE, rgb(0x3C1F56)},  // kLeft   (H-Slice purple)
+        {rgb(0x00FFFF), WHITE, rgb(0x1542B7)},  // kDown   (cyan)
+        {rgb(0x12FA05), WHITE, rgb(0x0A4447)},  // kUp     (green)
+        {rgb(0xF9393F), WHITE, rgb(0x651038)},  // kRight  (red)
+        {rgb(0xC24B99), WHITE, rgb(0x3C1F56)},  // kCenter
+    };
+    for (int d = 0; d < 5; ++d) {
+        const Color* pal = hrkPal[d];
+        if (const HrkFrame* f = hrkFrame(noteFrame[d])) {
+            if (g_note[d].id) UnloadTexture(g_note[d]);
+            g_note[d] = bakeHrk(*f, pal, false);
+        }
+        if (const HrkFrame* f = hrkFrame("red hold piece0000")) {
+            if (g_holdPiece[d].id) UnloadTexture(g_holdPiece[d]);
+            g_holdPiece[d] = bakeHrk(*f, pal, false);
+        }
+        if (const HrkFrame* f = hrkFrame("red hold end0000")) {
+            if (g_holdEnd[d].id) UnloadTexture(g_holdEnd[d]);
+            g_holdEnd[d] = bakeHrk(*f, pal, false);
+        }
+    }
+    for (int d = 0; d < 4; ++d) {
+        if (const HrkFrame* f = hrkFrame(arrowFrame[d])) g_receptorDir[d] = bakeHrk(*f, hrkPal[d], false);
+    }
+    UnloadImage(g_hrkImg);
+    g_hrkImg = {};
+    g_hrk = true;
+}
+
 }  // namespace
 
 const Font& fontOf(FontId f) {
@@ -127,6 +259,7 @@ void init(const std::string& baseDir) {
     for (int d = 0; d < 5; ++d) g_note[d] = makeGlyph(d == kCenter ? 1 : 0, dirColor(d), false, 384);
     g_receptor[0] = makeGlyph(0, WHITE, true, 384);
     g_receptor[1] = makeGlyph(1, WHITE, true, 384);
+    loadHrk(baseDir);
 }
 
 void shutdown() {
@@ -137,6 +270,10 @@ void shutdown() {
     UnloadTexture(g_glow);
     for (auto& t : g_note) UnloadTexture(t);
     for (auto& t : g_receptor) UnloadTexture(t);
+    for (auto& t : g_receptorDir) UnloadTexture(t);
+    for (auto& t : g_holdPiece) UnloadTexture(t);
+    for (auto& t : g_holdEnd) UnloadTexture(t);
+    g_hrkFrames.clear();
 }
 
 // ---------------------------------------------------------------- canvas --
@@ -343,19 +480,54 @@ static float dirRotation(int dir) {
 void drawNote(int dir, Vector2 c, float size, float alpha, float scale, float extraRotDeg) {
     const Texture2D& t = g_note[clampv(dir, 0, 4)];
     const float s = size * scale;
+    // HRK sprites are directional already (lane is shown by colour, like
+    // H-Slice); the procedural glyphs need the per-direction rotation.
+    const float rot = (g_hrk ? 0.0f : dirRotation(dir)) + extraRotDeg;
     DrawTexturePro(t, {0, 0, float(t.width), float(t.height)}, {c.x, c.y, s, s}, {s * 0.5f, s * 0.5f},
-                   dirRotation(dir) + extraRotDeg, fade(WHITE, alpha));
+                   rot, fade(WHITE, alpha));
 }
 
 void drawReceptor(int dir, Vector2 c, float size, Color tint, float scale, float extraRotDeg) {
-    const Texture2D& t = g_receptor[dir == kCenter ? 1 : 0];
     const float s = size * scale;
+    if (g_hrk && dir >= kLeft && dir <= kRight && g_receptorDir[dir].id) {
+        const Texture2D& t = g_receptorDir[dir];
+        DrawTexturePro(t, {0, 0, float(t.width), float(t.height)}, {c.x, c.y, s, s}, {s * 0.5f, s * 0.5f},
+                       extraRotDeg, tint);
+        return;
+    }
+    const Texture2D& t = g_receptor[dir == kCenter ? 1 : 0];
     DrawTexturePro(t, {0, 0, float(t.width), float(t.height)}, {c.x, c.y, s, s}, {s * 0.5f, s * 0.5f},
                    dirRotation(dir) + extraRotDeg, tint);
 }
 
 void drawSustain(int dir, float x, float y0, float y1, float width, float alpha, bool capAtY1) {
     if (std::fabs(y1 - y0) < 0.5f) return;
+    const int d = clampv(dir, 0, 4);
+    if (g_hrk && g_holdPiece[d].id) {
+        const float top = std::min(y0, y1), h = std::fabs(y1 - y0);
+        DrawRectangleRec({x - width * 0.5f - 3, top, width + 6, h}, fade(Color{22, 12, 38, 255}, alpha * 0.85f));
+        const Texture2D& p = g_holdPiece[d];
+        const float tile = std::max(8.0f, width);  // 60px source tile drawn at width px: aspect kept
+        for (float y = top; y < top + h; y += tile) {
+            const float th = std::min(tile, top + h - y);
+            DrawTexturePro(p, {0, 0, 60, 60}, {x - width * 0.5f, y, width, th}, {0, 0}, 0,
+                           fade(WHITE, alpha * 0.95f));
+        }
+        if (capAtY1 && g_holdEnd[d].id) {
+            // The sprite is a bar segment on top with the diamond tip below:
+            // anchor its tip to the sustain end, flipping when the tail is up.
+            const Texture2D& e = g_holdEnd[d];
+            const float es = width * 1.5f;
+            if (y1 >= y0) {
+                DrawTexturePro(e, {0, 0, 60, 60}, {x - es * 0.5f, y1 - es, es, es}, {0, 0}, 0,
+                               fade(WHITE, alpha));
+            } else {
+                DrawTexturePro(e, {0, 60, 60, -60}, {x - es * 0.5f, y1, es, es}, {0, 0}, 0,
+                               fade(WHITE, alpha));
+            }
+        }
+        return;
+    }
     const Color base = dirColor(dir);
     const float top = std::min(y0, y1), h = std::fabs(y1 - y0);
     DrawRectangleRec({x - width * 0.5f - 3, top, width + 6, h}, fade(Color{22, 12, 38, 255}, alpha * 0.85f));

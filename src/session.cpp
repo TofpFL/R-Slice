@@ -22,6 +22,7 @@ void Session::init(const Chart& chart, const SessionConfig& cfg) {
         for (int l = 0; l < 9; ++l) {
             lanes_[s][l].clear();
             cursor_[s][l] = 0;
+            gcScan_[s][l] = 0;
             activeHold_[s][l] = -1;
             maxSus_[s][l] = 0;
         }
@@ -65,7 +66,7 @@ void Session::addHealth(double v) {
 }
 
 void Session::hitNote(int lane, size_t idx, double songMs, bool bot) {
-    std::vector<LaneNote>& v = lanes_[1][lane];
+    std::deque<LaneNote>& v = lanes_[1][lane];
     LaneNote& n = v[idx];
     const double err = bot ? 0.0 : (songMs - n.t) / cfg_.rate;
     Rating r = kSinful;
@@ -135,7 +136,7 @@ void Session::press(int lane, double songMs) {
     if (lane < 0 || lane >= keys_) return;
     held_[lane] = true;
     if (cfg_.botplay || (autoLanes_ >> lane & 1u)) return;
-    std::vector<LaneNote>& v = lanes_[1][lane];
+    std::deque<LaneNote>& v = lanes_[1][lane];
     const double win = kMissWindowMs * cfg_.rate;
     const double mineWin = kRatings[kDivine].windowMs * cfg_.rate;
     long long best = -1, mine = -1;
@@ -214,7 +215,7 @@ void Session::setTotals(uint64_t player, uint64_t opponent) {
 
 void Session::appendLaneNote(int side, int lane, const LaneNote& n) {
     if (side < 0 || side > 1 || lane < 0 || lane >= keys_) return;
-    std::vector<LaneNote>& v = lanes_[side][lane];
+    std::deque<LaneNote>& v = lanes_[side][lane];
     v.push_back(n);
     maxSus_[side][lane] = std::max(maxSus_[side][lane], n.len);
 }
@@ -229,11 +230,16 @@ void Session::gcBefore(double songMs) {
     const double cutoff = songMs - kGcMarginMs;
     for (int s = 0; s < 2; ++s) {
         for (int l = 0; l < keys_; ++l) {
-            std::vector<LaneNote>& v = lanes_[s][l];
+            std::deque<LaneNote>& v = lanes_[s][l];
             if (v.empty()) continue;
-            // Prefix of fully-resolved notes whose sustain ended before the
-            // cutoff. Anything pending, holding, or still sustaining stays.
-            size_t keepFrom = 0;
+            // gcScan_ is the count of leading notes already confirmed dead
+            // by earlier passes — the scan resumes there instead of
+            // re-walking the whole dead prefix every GC. Deadness is
+            // monotonic (states never un-resolve, cutoff only advances),
+            // so the hint stays valid until rewindTo/init reset it.
+            size_t& scan = gcScan_[s][l];
+            if (scan > v.size()) scan = v.size();
+            size_t keepFrom = scan;
             while (keepFrom < v.size()) {
                 const LaneNote& n = v[keepFrom];
                 const bool resolved = n.state == kHit || n.state == kMissed ||
@@ -245,11 +251,26 @@ void Session::gcBefore(double songMs) {
             // Never drop the note an active hold is sustaining.
             const long long ah = activeHold_[s][l];
             if (ah >= 0 && size_t(ah) < keepFrom) keepFrom = size_t(ah) + 1;
-            if (keepFrom == 0 || keepFrom > v.size()) continue;
-            v.erase(v.begin(), v.begin() + keepFrom);
-            if (cursor_[s][l] >= keepFrom) cursor_[s][l] -= keepFrom;
+            // Amortize the erase: only once a meaningful prefix has
+            // accumulated (or the container is mostly dead). Small
+            // prefixes are re-checked cheaply on the next pass.
+            size_t doErase = 0;
+            if (!(keepFrom < 512 && keepFrom * 4 < v.size()) && keepFrom > 0) {
+                // Bounded erase: drop at most kGcChunk notes per pass so a
+                // GC never walks millions of elements in one frame. On a
+                // deque a front erase destroys the prefix in place — it
+                // does NOT memmove the surviving tail the way vector::erase
+                // did, which was the source of multi-ms GC spikes.
+                constexpr size_t kGcChunk = 131072;
+                doErase = std::min(keepFrom, kGcChunk);
+                if (ah >= 0 && doErase > size_t(ah)) doErase = size_t(ah);
+            }
+            scan = keepFrom - doErase;
+            if (doErase == 0) continue;
+            for (size_t i = 0; i < doErase; ++i) v.pop_front();
+            if (cursor_[s][l] >= doErase) cursor_[s][l] -= doErase;
             else cursor_[s][l] = 0;
-            if (activeHold_[s][l] >= 0) activeHold_[s][l] -= int64_t(keepFrom);
+            if (activeHold_[s][l] >= 0) activeHold_[s][l] -= int64_t(doErase);
         }
     }
 }
@@ -260,7 +281,7 @@ void Session::update(double songMs) {
     const double win = kMissWindowMs * cfg_.rate;
     for (int lane = 0; lane < keys_; ++lane) {
         // ---- player side
-        std::vector<LaneNote>& v = lanes_[1][lane];
+        std::deque<LaneNote>& v = lanes_[1][lane];
         long long& h = activeHold_[1][lane];
         if (h >= 0) {
             LaneNote& n = v[size_t(h)];
@@ -294,7 +315,7 @@ void Session::update(double songMs) {
         while (c < v.size() && v[c].state != kPending) ++c;
 
         // ---- opponent side (always perfect)
-        std::vector<LaneNote>& o = lanes_[0][lane];
+        std::deque<LaneNote>& o = lanes_[0][lane];
         long long& oh = activeHold_[0][lane];
         size_t& oc = cursor_[0][lane];
         while (oc < o.size() && o[oc].t <= songMs) {
@@ -331,12 +352,13 @@ void Session::update(double songMs) {
 void Session::rewindTo(double songMs) {
     for (int s = 0; s < 2; ++s)
         for (int l = 0; l < keys_; ++l) {
-            std::vector<LaneNote>& v = lanes_[s][l];
+            std::deque<LaneNote>& v = lanes_[s][l];
             const size_t first = size_t(std::lower_bound(v.begin(), v.end(), songMs,
                                                          [](const LaneNote& n, double t) { return n.t < t; }) - v.begin());
             for (size_t i = first; i < v.size(); ++i) v[i].state = kPending;
             cursor_[s][l] = first;
             activeHold_[s][l] = -1;
+            gcScan_[s][l] = 0;
         }
     lastMs_ = -1e18;
 }

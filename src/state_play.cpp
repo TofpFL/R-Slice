@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <thread>
 
 #include "audio_decode.hpp"
 #include "common.hpp"
@@ -147,6 +148,7 @@ void PlayState::update(double dt) {
         }
         if (scripts_) scripts_->call("onCustomSubstateUpdatePost", {scene::Value(name), scene::Value(dt)});
     }
+    updateVideoBg(dt);
     if (popupHold_) {  // "Popup" event: the song waits for OK
         // While recording nobody presses OK: the popup stays two seconds.
         const bool recordedLongEnough =
@@ -282,6 +284,72 @@ void PlayState::update(double dt) {
         songMs_ > songEnd + 20000.0 || wallCap) finish();
 }
 
+// ------------------------------------------------------- video background --
+
+void PlayState::setupVideoBg() {
+    App& a = app();
+    if (replaying_ || !a.mods.videoBg || !entry_) return;
+    // Same roots the Psych scene uses (minus .rchr mounting): the song's own
+    // folders, the mods/ dir, then every mod's shared asset folders.
+    std::vector<std::string> roots = entry_->assetRoots;
+    if (roots.empty() && !entry_->modRoot.empty()) roots.push_back(entry_->modRoot);
+    roots.push_back(a.base + "mods/");
+    bgVideoFiles_.setRoots(roots);
+    bgVideoFiles_.setSharedRoots(a.library.sharedAssetRootsFor(*entry_));
+    // Prefer a video named after the song, else take the first one found.
+    const std::vector<std::string> vids = bgVideoFiles_.list("videos", "");
+    std::string pick;
+    const std::string want = songPathName(entry_->songKey.empty() ? entry_->title : entry_->songKey);
+    const std::string wantTitle = songPathName(entry_->title);
+    for (const std::string& v : vids) {
+        std::string base = v.substr(v.find_last_of("/\\") + 1);
+        for (const char* ext : {".mp4", ".webm", ".mpg", ".mpeg", ".mov", ".avi", ".mkv"})
+            if (endsWithI(base, ext)) base.resize(base.size() - std::string(ext).size());
+        const std::string low = toLower(base);
+        if ((!want.empty() && low.find(want) != std::string::npos) ||
+            (!wantTitle.empty() && low.find(wantTitle) != std::string::npos)) {
+            pick = base;
+            break;
+        }
+        if (pick.empty()) pick = base;
+    }
+    if (pick.empty()) { bgVideoState_ = 3; return; }
+    bgVideoName_ = pick;
+    bgVideoState_ = 1;
+}
+
+void PlayState::updateVideoBg(double dt) {
+    if (bgVideoState_ == 0) return;
+    App& a = app();
+    if (bgVideoState_ == 2) {
+        bgVideo_->update(dt);
+        return;
+    }
+    if (bgVideoState_ != 1 || a.now < bgVideoRetry_) return;
+    bgVideoRetry_ = a.now + 0.5;  // ffmpeg conversion runs in the background
+    const VideoSource src = findVideo(bgVideoFiles_, bgVideoName_, a.base);
+    if (src.converting) return;
+    if (!src.error.empty()) { bgVideoState_ = 3; return; }
+    bgVideo_ = std::make_unique<VideoPlayer>();
+    if (!bgVideo_->open(src.playable, true, false)) {
+        bgVideo_.reset();
+        bgVideoState_ = 3;
+        return;
+    }
+    bgVideo_->setVolume(a.settings.musicVol);
+    bgVideoState_ = 2;
+}
+
+void PlayState::drawVideoBg() const {
+    if (!videoBgActive()) return;
+    const Texture2D& t = bgVideo_->texture();
+    const float vw = float(bgVideo_->width()), vh = float(bgVideo_->height());
+    if (vw <= 0 || vh <= 0) return;
+    const float sc = std::max(gfx::W / vw, gfx::H / vh);  // cover-fit, crop overflow
+    const float w = vw * sc, h = vh * sc;
+    DrawTexturePro(t, {0, 0, vw, vh}, {(gfx::W - w) * 0.5f, (gfx::H - h) * 0.5f, w, h}, {0, 0}, 0, WHITE);
+}
+
 void PlayState::draw() {
     App& a = app();
     const double now = a.now;
@@ -301,12 +369,21 @@ void PlayState::draw() {
             gfx::setViewWidth(gfx::W);
         }
     } else {
+        // The video background is a full-screen layer of its own: drawn inside
+        // the camera canvas it would inherit the zoom/focus transform.
+        if (videoBgActive()) {
+            gfx::beginCanvas();
+            drawVideoBg();
+            gfx::endCanvas();
+        }
         gfx::beginCanvas(0.94f * camZoom_, camFocus_);
-        stage_.drawBack(now);
-        const bool demise = left_.id == CharId::Demise;
-        drawCharacter(left_, {330, 600}, demise ? 0.95f : 1.0f, now, false);
-        drawCharacter(right_, {950, 612}, 1.0f, now, true);
-        stage_.drawFront(now);
+        if (!videoBgActive()) {
+            stage_.drawBack(now);
+            const bool demise = left_.id == CharId::Demise;
+            drawCharacter(left_, {330, 600}, demise ? 0.95f : 1.0f, now, false);
+            drawCharacter(right_, {950, 612}, 1.0f, now, true);
+            stage_.drawFront(now);
+        }
         gfx::endCanvas();
 
         gfx::beginCanvas();
@@ -341,6 +418,14 @@ void PlayState::setup() {
     chart_ = std::move(prep_.chart);
     noteStream_ = prep_.stream;
     streamMirror_ = prep_.mirrored;
+    feed_.bind(*noteStream_);
+    // Chunk decode is the prefetch bottleneck at high note density: the
+    // default of 2 workers cannot keep the LRU ahead of a 300K ev/s chart,
+    // so range() falls back to synchronous decode on the frame thread.
+    // Decodes are semaphore-bounded and each is memory-capped, so scaling
+    // to a handful of workers is safe on any machine.
+    feed_.setMaxConcurrentDecodes(
+        std::max(2, std::min(8, int(std::thread::hardware_concurrency()))));
     streamFailed_ = false;
     startPatternLog();
     cfg_.ghostTapping = a.settings.ghostTapping;
@@ -395,6 +480,7 @@ void PlayState::setup() {
     }
 
     psych_ = !entry_->builtin && setupPsych();
+    setupVideoBg();
     if (!psych_) layoutStrums();  // Psych mode laid them out before its scripts ran
     if (psych_) {
         leftColor_ = rgbColor(barColor_[0]);
@@ -482,9 +568,7 @@ void PlayState::restart() {
         // Metadata chart has no notes: totals come from the file header and
         // the pump refills the lanes from the start.
         session_.setTotals(chart_.playerNotes, chart_.opponentNotes);
-        fedUs_ = std::numeric_limits<int64_t>::min() / 4;
-        prefetchUs_ = fedUs_;
-        fedEvents_ = appendedEvents_ = 0;
+        feed_.reset();
         lastFeedLogMs_ = -1e18;
         startPatternLog();  // fresh log for the replayed run
     }
@@ -544,50 +628,20 @@ void PlayState::beginCountdown() {
 // ------------------------------------------------------------------- input --
 
 void PlayState::pumpNotes() {
-    // .raid charts: feed every event up to the scroll horizon into the
-    // session lanes, then warm the next stretch on worker threads. Notes are
-    // judged ~166 ms after their time; 4 s of lookahead covers judgement and
-    // on-screen scroll, and gcBefore keeps lane memory bounded.
-    constexpr double kLookaheadMs = 4000.0;
-    constexpr double kPrefetchMs = 16000.0;
-    const int64_t endUs = int64_t(std::max(0.0, songMs_ + kLookaheadMs) * 1000.0);
-    if (endUs > fedUs_) {
-        std::vector<raid::Event> evs;
-        std::vector<uint64_t> idx;
-        std::string err;
-        if (!noteStream_->pump(fedUs_, endUs, evs, idx, err)) {
-            debug_.push_back({"raid stream: " + err, {255, 80, 80, 255}, app().now});
-            streamFailed_ = true;
-            return;
-        }
-        fedEvents_ += evs.size();
-        for (size_t i = 0; i < evs.size(); ++i) {
-            const raid::Event& e = evs[i];
-            LaneNote ln;
-            ln.t = double(e.timeUs) / 1000.0;
-            ln.len = double(e.lengthUs) / 1000.0;
-            ln.kind = e.kind;
-            ln.flags = e.flags;
-            ln.type = e.type;
-            ln.stack = std::max<uint16_t>(1, e.stack);
-            ln.id = uint32_t(idx[i]);  // global expanded index (stable across rewind)
-            const int side = int(e.side) ^ (streamMirror_ ? 1 : 0);
-            if (e.lane < chart_.keys) {
-                session_.appendLaneNote(side, int(e.lane), ln);
-                ++appendedEvents_;
-            }
-        }
-        fedUs_ = endUs;
-        session_.gcBefore(songMs_);
-        feedLog(songMs_);
+    // .raid charts: PlaybackFeed owns the pump/prefetch horizons, the
+    // Event->LaneNote conversion and session GC — the playstate only
+    // advances the song clock. 4 s lookahead covers judgement and on-screen
+    // scroll; 16 s prefetch warms upcoming chunks on worker threads.
+    std::string err;
+    if (!feed_.advance(songMs_, session_, chart_.keys, streamMirror_, err)) {
+        debug_.push_back({"raid stream: " + err, {255, 80, 80, 255}, app().now});
+        streamFailed_ = true;
+        return;
     }
-    if (endUs >= prefetchUs_) {
-        noteStream_->prefetch(endUs, endUs + int64_t(kPrefetchMs * 1000.0));
-        prefetchUs_ = endUs + int64_t(kPrefetchMs * 500.0);
-    }
+    feedLog(songMs_);
     if (patternLog_) {
         std::string lerr;
-        if (!patternLog_->tick(endUs, lerr)) {
+        if (!patternLog_->tick(raid::PlaybackFeed::horizonUs(songMs_), lerr)) {
             debug_.push_back({"pattern log: " + lerr, {255, 80, 80, 255}, app().now});
             patternLog_.reset();
         }
@@ -604,7 +658,7 @@ void PlayState::feedLog(double songMs) {
     long long laneNotes = 0, pend = 0, hit = 0, miss = 0, hold = 0, done = 0, drop = 0, mh = 0, mp = 0;
     for (int side = 0; side < 2; ++side)
         for (int l = 0; l < chart_.keys; ++l) {
-            const std::vector<LaneNote>& v = session_.lane(side, l);
+            const std::deque<LaneNote>& v = session_.lane(side, l);
             laneNotes += (long long)v.size();
             for (const LaneNote& n : v) {
                 switch (n.state) {
@@ -622,7 +676,7 @@ void PlayState::feedLog(double songMs) {
     const std::string path = a.userDir + "raid_feed_log.txt";
     if (FILE* f = fopen(path.c_str(), "ab")) {
         fprintf(f, "t=%8.0fms songMs=%9.1f fed=%llu app=%llu lane=%lld | pend=%lld hit=%lld miss=%lld hold=%lld done=%lld drop=%lld mine=%lld/%lld | drawn=%d cand=%d failed=%d\n",
-                songMs, songMs_, (unsigned long long)fedEvents_, (unsigned long long)appendedEvents_,
+                songMs, songMs_, (unsigned long long)feed_.fedEvents(), (unsigned long long)feed_.appendedEvents(),
                 laneNotes, pend, hit, miss, hold, done, drop, mh, mp,
                 drawnNotes_, candidateNotes_, streamFailed_ ? 1 : 0);
         for (int side = 0; side < 2; ++side) {
@@ -1322,7 +1376,7 @@ void PlayState::drawLanes() {
                 }
             }
             const float dirSign = st.downScroll ? -1.0f : 1.0f;
-            const std::vector<LaneNote>& v = session_.lane(side, lane);
+            const std::deque<LaneNote>& v = session_.lane(side, lane);
             if (!v.empty() && !visualsOnly_) {  // visuals preview: receptors only, no notes
                 ui.beginDir(dir);  // this lane's colours (Psych colour-template skins)
                 const double tStart = songMs_ - reach * 0.5 - session_.maxSustain(side, lane);
@@ -1800,6 +1854,26 @@ void PlayState::drawDebugOverlay() {
                             num(double(nps_))});
     rows.push_back({"FRAME", TextFormat("%d fps  |  update %.2f ms  |  draw %.2f ms  |  worst %.1f ms", int(a.fps + 0.5f), a.updateMs,
                                         a.drawMs, a.worstFrameMs)});
+    {
+        // Frame-time distribution over the last ~4 s (the 240-frame ring).
+        const auto& fh = a.frameHist();
+        std::vector<float> ft(fh.begin(), fh.end());
+        ft.erase(std::remove(ft.begin(), ft.end(), 0.0f), ft.end());
+        if (!ft.empty()) {
+            std::sort(ft.begin(), ft.end());
+            auto at = [&](double q) { return ft[size_t(ft.size() * q)]; };
+            rows.push_back({"FTIMES", TextFormat("p50 %.1f  p95 %.1f  p99 %.1f  p99.9 %.1f  max %.1f ms",
+                                                 at(0.5), at(0.95), at(0.99), at(0.999), ft.back())});
+        }
+    }
+    if (noteStream_) {
+        uint64_t ch = 0, cm = 0, cd = 0, cbd = 0;
+        noteStream_->reader().cacheStats(ch, cm, cd, cbd);
+        rows.push_back({"FEED", TextFormat("pump %.2f  convert %.2f  gc %.2f ms  |  cache %llu hit / %llu miss  |  %.1f MB decoded",
+                                           feed_.lastPumpMs(), feed_.lastConvertMs(), feed_.lastGcMs(),
+                                           (unsigned long long)ch, (unsigned long long)cm,
+                                           double(cbd) / 1048576.0)});
+    }
     if (scripts_) rows.push_back({"SCRIPTS", TextFormat("%zu loaded  |  note callbacks %s", scripts_->count(),
                                                          a.settings.luaNoteCallbacks ? "on" : "off")});
     const float x = 14, w = 900, lh = 19;

@@ -689,11 +689,24 @@ bool Doc::save(const std::string& outPath, raid::Info* stats, std::string& err) 
         outs.push_back(std::move(d));
     }
 
+    // Embedded asset packs (.rchr trailers) live outside the sections this
+    // writer rebuilds — carry them over so a chart edit doesn't drop them.
+    std::vector<raid::EmbeddedAsset> carried;
+    if (!path.empty() && raid::isRaidFile(path)) {
+        raid::Reader src;
+        std::string rerr;
+        if (src.open(path, rerr) && !src.embeddedAssets(carried, rerr)) carried.clear();
+    }
+
     raid::EncodeOptions opt;
     if (!raid::writeRaidDoc(dest, patSection, outs, info.logicalEvents,
                             info.literalEvents, info.uniqueEvents,
                             info.uniqueNotes, metaJson, opt, stats, err))
         return false;
+    if (!carried.empty()) {
+        std::string aerr;
+        if (!raid::embedAssets(dest, carried, aerr)) { err = aerr; return false; }
+    }
     dirty = false;
     return true;
 }

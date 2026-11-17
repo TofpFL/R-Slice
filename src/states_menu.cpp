@@ -646,6 +646,7 @@ public:
                     m.scrollValue = m.scrollType == 1 ? clampv(m.scrollValue, 0.25, 5.0) : clampv(m.scrollValue, 0.5, 10.0);
                 }
                 if (modSel_ == 6) m.patternLog = !m.patternLog;
+                if (modSel_ == 7) m.videoBg = !m.videoBg;
             }
             if (in.back() || in.pressed(KEY_TAB)) modsOpen_ = false;
             return;
@@ -912,7 +913,7 @@ private:
     void drawMods() {
         const Modifiers& m = app().mods;
         DrawRectangleRec({0, 0, gfx::W, gfx::H}, Color{0, 0, 0, 150});
-        DrawRectangleRounded({370, 140, 540, 430}, 0.08f, 12, Color{16, 10, 30, 245});
+        DrawRectangleRounded({370, 130, 540, 460}, 0.08f, 12, Color{16, 10, 30, 245});
         gfx::text(FontId::Title, "MODIFIERS", 640, 158, 38, kGold, Align::Center, 2.0f);
         static const char* scrollTypes[3] = {"the chart's", "multiplied", "constant"};
         const std::string rows[kModRows] = {
@@ -921,11 +922,12 @@ private:
             std::string("Play as the opponent   ") + (m.mirror ? "ON" : "OFF"), std::string("Scroll speed   ") + scrollTypes[m.scrollType],
             m.scrollType == 0 ? std::string("Scroll value   -")
                               : std::string(TextFormat(m.scrollType == 1 ? "Scroll value   x%.2f" : "Scroll value   %.1f", m.scrollValue)),
-            std::string("Pattern log (.raid)   ") + (m.patternLog ? "ON" : "OFF")};
+            std::string("Pattern log (.raid)   ") + (m.patternLog ? "ON" : "OFF"),
+            std::string("Video background   ") + (m.videoBg ? "ON" : "OFF")};
         for (int i = 0; i < kModRows; ++i)
-            gfx::text(FontId::Ui, rows[i], 640, 210.0f + i * 46, 30, i == modSel_ ? kGold : (i == 5 && m.scrollType == 0 ? fade(kIvory, 0.4f) : kIvory),
+            gfx::text(FontId::Ui, rows[i], 640, 200.0f + i * 44, 30, i == modSel_ ? kGold : (i == 5 && m.scrollType == 0 ? fade(kIvory, 0.4f) : kIvory),
                       Align::Center, 1.5f);
-        gfx::text(FontId::Ui, "Scores are only saved at 1.00x or faster, without botplay or practice", 640, 532, 18,
+        gfx::text(FontId::Ui, "Scores are only saved at 1.00x or faster, without botplay or practice", 640, 560, 18,
                   fade(kIvory, 0.6f), Align::Center);
     }
 
@@ -967,7 +969,7 @@ private:
     bool previewPlaying_ = false, previewPaused_ = false;
     double previewLen_ = 0, previewCur_ = 0, scrubHold_ = 0;
     bool modsOpen_ = false;
-    static constexpr int kModRows = 7;
+    static constexpr int kModRows = 8;
     int modSel_ = 0;
     bool importing_ = false;
     std::string note_;

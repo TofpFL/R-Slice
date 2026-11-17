@@ -230,6 +230,7 @@ if(GH_BUILD_GAME)
   src/fp_capsule.cpp
     src/states_options.cpp
     src/state_play.cpp
+    src/state_vchart.cpp
     src/vizbar.cpp
     src/play_psych.cpp
     src/play_visuals.cpp
@@ -267,6 +268,7 @@ if(GH_BUILD_GAME)
     target_sources(raide PRIVATE src/windows/resource.rc src/win_icon.cpp)  # assets/icon.ico
   endif()
   target_link_libraries(raide PRIVATE gh_core raylib)
+  set_target_properties(raide PROPERTIES OUTPUT_NAME "R-Slice")
   target_compile_definitions(raide PRIVATE GH_VERSION="${PROJECT_VERSION}")
   target_include_directories(raide PRIVATE ${pl_mpeg_SOURCE_DIR})
   if(MSVC)
@@ -309,10 +311,11 @@ if(GH_BUILD_GAME)
     add_custom_command(TARGET raide POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/assets $<TARGET_FILE_DIR:raide>/assets
       COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/songs $<TARGET_FILE_DIR:raide>/songs
-      COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:raide>/mods)
+      COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:raide>/mods
+      COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/mods $<TARGET_FILE_DIR:raide>/mods)
 
     install(TARGETS raide RUNTIME DESTINATION .)
-    install(DIRECTORY assets songs DESTINATION .)
+    install(DIRECTORY assets songs mods DESTINATION .)
     install(FILES README.md LICENSE DESTINATION .)
   endif()
 endif()
