@@ -30,6 +30,7 @@
 // unknown flag bits; writers set only defined flag bits.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <future>
@@ -72,6 +73,40 @@ struct Event {
     uint8_t flags = 0;   // NoteFlag bits
     uint16_t type = 0;   // index into Chart::noteTypes
     uint16_t stack = 1;  // merged notes this event counts for
+};
+
+// Decode-work counters for lazy-evaluation benchmarking. Atomics because
+// chunk decodes can run on prefetch worker threads.
+struct EvalStats {
+    std::atomic<uint64_t> leafInstances{0};   // emitLeafCached calls
+    std::atomic<uint64_t> leafFallbacks{0};   // declined to reference loop
+    std::atomic<uint64_t> repeatsIterated{0}; // per-repeat bodies executed
+    std::atomic<uint64_t> repeatsSkipped{0};  // repeats bypassed arithmetically
+    std::atomic<uint64_t> opsDecoded{0};      // op headers walked
+    EvalStats() = default;
+    EvalStats(const EvalStats& o)
+        : leafInstances(o.leafInstances.load()),
+          leafFallbacks(o.leafFallbacks.load()),
+          repeatsIterated(o.repeatsIterated.load()),
+          repeatsSkipped(o.repeatsSkipped.load()),
+          opsDecoded(o.opsDecoded.load()) {}
+    EvalStats& operator=(const EvalStats& o) {
+        if (this != &o) {
+            leafInstances = o.leafInstances.load();
+            leafFallbacks = o.leafFallbacks.load();
+            repeatsIterated = o.repeatsIterated.load();
+            repeatsSkipped = o.repeatsSkipped.load();
+            opsDecoded = o.opsDecoded.load();
+        }
+        return *this;
+    }
+    void add(const EvalStats& o) {
+        leafInstances += o.leafInstances.load();
+        leafFallbacks += o.leafFallbacks.load();
+        repeatsIterated += o.repeatsIterated.load();
+        repeatsSkipped += o.repeatsSkipped.load();
+        opsDecoded += o.opsDecoded.load();
+    }
 };
 
 struct Info {
@@ -204,6 +239,10 @@ public:
     // the reference implementation.
     bool rangeWindow(int64_t startUs, int64_t endUs, std::vector<Event>& out,
                      std::vector<uint64_t>& indices, std::string& err);
+
+    // Cumulative decode-work counters (leaf instances, repeats iterated vs
+    // arithmetically skipped, ops walked). Snapshot for benchmarking.
+    EvalStats evalStats() const;
 
     // One stretch of a chunk's op stream, in playback order. Only LEAF
     // ops produce segments: literal runs always, and pattern instances

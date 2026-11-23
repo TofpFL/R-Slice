@@ -7,6 +7,8 @@
 //   raid_engine meta <file.raid>                     the chart metadata (JSON)
 //   raid_engine patterns <file.raid> [startMs] [endMs] op-stream log: which
 //                                                    pattern plays when
+//   raid_engine flppatterns <file.flp>               per-pattern charted-note
+//                                                    census (discrepancy detection)
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -365,6 +367,92 @@ static int patterns(const std::string& path, const char* a, const char* b) {
     return 0;
 }
 
+// flppatterns <file.flp>: per-pattern charted-note census for discrepancy
+// detection. For every FL pattern it counts the notes flpToChart would
+// emit, split into in-bounds (inside the pattern's playlist loop length)
+// and artifacts (FL keeps notes past the loop point; playlist clips never
+// play them, so raid conversion drops them too).
+static int flppatterns(const std::string& path) {
+    FlpProject p;
+    std::string err;
+    if (!readFlpFile(path, p, err)) {
+        std::printf("load failed: %s\n", err.c_str());
+        return 1;
+    }
+    const double bpm = (p.bpm > 0 ? p.bpm : 120.0) * flpBpmScale(p);
+    const double msPerTick = 60000.0 / (bpm * p.ppqn);
+    // Loop length per pattern in ticks - same rule writeRaidFlp uses:
+    // declared length wins unless it overhangs the content; the content
+    // extent is the last note onset rounded up to a whole bar.
+    const uint64_t barTicks = p.timeSigDen > 0
+        ? uint64_t(p.timeSigNum) * uint64_t(p.ppqn) * 4 / uint64_t(p.timeSigDen)
+        : 0;
+    std::set<int> used;
+    for (const FlpPlaylistItem& it : p.playlist)
+        if (!it.muted && it.pattern > 0) used.insert(it.pattern);
+
+    std::printf("flppatterns: %s\n", path.c_str());
+    std::printf("  ppqn=%d bpm=%.2f patterns=%zu playlist=%zu\n",
+                p.ppqn, bpm, p.patterns.size(), p.playlist.size());
+    // raw = notes before finalize() merges same-lane sub-ms notes into
+    // stacks; charted/inbounds/artifacts count merged events; rawin/rawart
+    // are the stack-weighted split of the raw notes at the loop boundary.
+    uint64_t tRaw = 0, tCharted = 0, tArtifacts = 0, tPool = 0;
+    uint64_t tRawArt = 0, tRawPool = 0, tRawPoolUsed = 0, tPoolUsed = 0;
+    int totPatterns = 0;
+    for (const FlpPattern& fp : p.patterns) {
+        Chart c;
+        std::string cerr;
+        if (!flpToChart(p, fp.number, c, cerr)) {
+            std::printf("pat %4d \"%s\": no chart notes\n",
+                        fp.number, fp.name.c_str());
+            continue;
+        }
+        ++totPatterns;
+        uint64_t lastStart = 0, maxEnd = 0;
+        for (const FlpNote& n : fp.notes) {
+            lastStart = std::max<uint64_t>(lastStart, uint64_t(n.time));
+            maxEnd = std::max<uint64_t>(maxEnd, uint64_t(n.time) + uint64_t(n.duration));
+        }
+        uint64_t contentTicks = 0;
+        if (barTicks)
+            contentTicks = lastStart ? (lastStart + barTicks - 1) / barTicks * barTicks : barTicks;
+        else
+            contentTicks = maxEnd;
+        uint64_t ticks = fp.lengthTicks;
+        if (!ticks || (contentTicks && ticks > contentTicks)) ticks = contentTicks;
+        const double periodMs = double(ticks) * msPerTick;
+        uint64_t inBounds = 0, artifacts = 0, rawIn = 0, rawArt = 0;
+        for (const Note& n : c.notes) {
+            const bool out = periodMs > 0 && n.time >= periodMs;
+            (out ? artifacts : inBounds)++;
+            (out ? rawArt : rawIn) += n.stack ? n.stack : 1;
+        }
+        const bool isUsed = used.count(fp.number) != 0;
+        std::printf("pat %4d \"%s\": raw=%llu charted=%llu inbounds=%llu artifacts=%llu rawin=%llu rawart=%llu len=%llut used=%d\n",
+                    fp.number, fp.name.c_str(),
+                    (unsigned long long)c.rawNoteCount,
+                    (unsigned long long)c.notes.size(),
+                    (unsigned long long)inBounds, (unsigned long long)artifacts,
+                    (unsigned long long)rawIn, (unsigned long long)rawArt,
+                    (unsigned long long)ticks, isUsed ? 1 : 0);
+        tRaw += c.rawNoteCount;
+        tCharted += c.notes.size();
+        tArtifacts += artifacts;
+        tPool += inBounds;
+        tRawArt += rawArt;
+        tRawPool += rawIn;
+        if (isUsed) { tPoolUsed += inBounds; tRawPoolUsed += rawIn; }
+    }
+    std::printf("[flp-total] patterns=%d raw=%llu charted=%llu artifacts=%llu pool=%llu poolused=%llu rawart=%llu rawpool=%llu rawpoolused=%llu\n",
+                totPatterns, (unsigned long long)tRaw,
+                (unsigned long long)tCharted, (unsigned long long)tArtifacts,
+                (unsigned long long)tPool, (unsigned long long)tPoolUsed,
+                (unsigned long long)tRawArt, (unsigned long long)tRawPool,
+                (unsigned long long)tRawPoolUsed);
+    return 0;
+}
+
 // Replays the game's feed loop: 60 fps song clock, 4 s pump window,
 // 16 s async prefetch, per-10 s event buckets. Catches stream failures
 // and dropped lanes that `verify` (one sequential decode) cannot see.
@@ -459,6 +547,285 @@ static int slicebench(const std::string& path) {
     }
     std::printf("%s: %llu logical events, %.0f ms\n", path.c_str(),
                 (unsigned long long)logical, lengthMs);
+    return 0;
+}
+
+// repgen: pattern-instance stress chart. Emits `repeats` copies of an
+// m-event motif spaced `periodMs` apart, so the encoder stores one leaf
+// pattern plus an instance op with reps ~= repeats. chunkEvents controls
+// how many expanded events fit per chunk — crank it toward kMaxChunkExpand
+// (4194304) to keep giant instances inside a single chunk.
+//   raid_engine repgen <out.raid> <repeats> <motifEvents> <periodMs>
+//                   [chunkEvents] [stack] [keys]
+static int repgen(int argc, char** argv) {
+    if (argc < 6) {
+        std::printf("usage: raid_engine repgen <out.raid> <repeats> <motifEvents>"
+                    " <periodMs> [chunkEvents] [stack] [keys]\n");
+        return 1;
+    }
+    const std::string out = argv[2];
+    const uint64_t repeats = std::strtoull(argv[3], nullptr, 10);
+    const int m = std::atoi(argv[4]);
+    const double periodMs = std::atof(argv[5]);
+    const uint32_t chunkEvents = argc > 6 ? uint32_t(std::strtoul(argv[6], nullptr, 10)) : 4194304;
+    const uint16_t stack = argc > 7 ? uint16_t(std::strtoul(argv[7], nullptr, 10)) : 1;
+    const int keys = argc > 8 ? std::atoi(argv[8]) : 4;
+    if (m < 2 || m > 64 || repeats == 0 || periodMs <= 0) {
+        std::printf("bad params (motif 2..64, repeats>0, periodMs>0)\n");
+        return 1;
+    }
+    const uint64_t total = repeats * uint64_t(m);
+    if (total > 64000000ull) {
+        std::printf("event count %llu too large (max 64M — RAM bound)\n",
+                    (unsigned long long)total);
+        return 1;
+    }
+    const int64_t periodUs = int64_t(periodMs * 1000.0);
+    const int64_t localStep = periodUs / m;
+    std::vector<raid::Event> evs;
+    evs.reserve(size_t(total));
+    for (uint64_t r = 0; r < repeats; ++r) {
+        const int64_t base = int64_t(r) * periodUs;
+        for (int m2 = 0; m2 < m; ++m2) {
+            raid::Event e;
+            e.timeUs = base + int64_t(m2) * localStep;
+            e.lengthUs = 0;
+            e.lane = uint8_t(m2 % keys);
+            e.side = uint8_t((m2 / keys) % 2);
+            e.kind = 0;
+            e.stack = stack;
+            evs.push_back(e);
+        }
+    }
+    Chart meta;
+    meta.title = "repstress";
+    meta.difficulty = "Stress";
+    meta.keys = keys;
+    meta.tempo.push_back({0, 120});
+    meta.playerNotes = meta.opponentNotes = 0;
+    meta.lengthMs = double(evs.back().timeUs) / 1000.0;
+    raid::EncodeOptions opt;
+    opt.chunkEvents = chunkEvents;
+    raid::Info info;
+    std::string err;
+    if (!raid::writeRaid(out, evs, raid::chartMetaJson(meta), opt, &info, err)) {
+        std::printf("encode failed: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("wrote %s: %llu events -> %llu logical, %llu chunks, %llu patterns\n",
+                out.c_str(), (unsigned long long)total,
+                (unsigned long long)info.logicalEvents,
+                (unsigned long long)info.chunkCount,
+                (unsigned long long)info.patternCount);
+    return 0;
+}
+
+// ---- stressgen: hand-authored giant pattern instance -------------------
+// Builds a .raid whose single chunk is one kOpPattern op referencing a
+// small leaf literal, with an arbitrary repeat count — the shape real
+// encoder output takes, but with reps far beyond what pattern matching
+// would find in feasible input. Goes through writeRaidDoc so the file is
+// indistinguishable from encoder output.
+namespace {
+struct SBuf {
+    std::vector<char> b;
+    void u8(uint32_t v) { b.push_back(char(v & 0xFF)); }
+    void u16(uint32_t v) { u8(v); u8(v >> 8); }
+    void u32(uint32_t v) { u16(v); u16(v >> 16); }
+    void u64(uint64_t v) { u32(uint32_t(v)); u32(uint32_t(v >> 32)); }
+    void var(uint64_t v) {
+        while (v >= 0x80) { u8(uint32_t(v) | 0x80); v >>= 7; }
+        u8(uint32_t(v));
+    }
+    void zig(int64_t v) { var((uint64_t(v) << 1) ^ uint64_t(v >> 63)); }
+    void raw(const void* p, size_t n) {
+        const char* c = static_cast<const char*>(p);
+        b.insert(b.end(), c, c + n);
+    }
+};
+uint32_t scrc(const void* p, size_t n) {
+    static uint32_t tab[256];
+    static bool init = false;
+    if (!init) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            tab[i] = c;
+        }
+        init = true;
+    }
+    uint32_t c = 0xFFFFFFFFu;
+    const unsigned char* s = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) c = tab[(c ^ s[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+} // namespace
+
+//   raid_engine stressgen <out.raid> <repeats> <motifEvents> <periodMs>
+//                         [stack] [keys]
+// expanded = repeats*motifEvents must be <= 4194304 (kMaxChunkExpand).
+static int stressgen(int argc, char** argv) {
+    if (argc < 6) {
+        std::printf("usage: raid_engine stressgen <out.raid> <repeats>"
+                    " <motifEvents> <periodMs> [stack] [keys]\n");
+        return 1;
+    }
+    const std::string out = argv[2];
+    const uint64_t reps = std::strtoull(argv[3], nullptr, 10);
+    const int m = std::atoi(argv[4]);
+    const double periodMs = std::atof(argv[5]);
+    const uint32_t stack = argc > 6 ? uint32_t(std::strtoul(argv[6], nullptr, 10)) : 1;
+    const int keys = argc > 7 ? std::atoi(argv[7]) : 4;
+    if (m < 1 || m > 1024 || reps == 0 || periodMs <= 0) {
+        std::printf("bad params\n");
+        return 1;
+    }
+    const uint64_t expanded = reps * uint64_t(m);
+    if (expanded > 4194304ull) {
+        std::printf("expanded %llu exceeds chunk cap 4194304\n",
+                    (unsigned long long)expanded);
+        return 1;
+    }
+    const int64_t periodUs = int64_t(periodMs * 1000.0);
+    const int64_t localStep = periodUs / m;
+
+    // Pattern 0: one literal-rel op, m events at local times j*localStep.
+    SBuf stream;
+    stream.u32(1);                 // opCount
+    stream.u8(1);                  // kOpLiteralRel
+    stream.u32(uint32_t(m));
+    stream.var(0);                 // first time delta from timeBase (t0=0)
+    for (int j = 1; j < m; ++j) stream.var(uint64_t(localStep));
+    for (int j = 0; j < m; ++j) stream.var(0);                    // lengthUs
+    for (int j = 0; j < m; ++j) stream.zig(0);                    // pitch deltas (pitch0=60 below)
+    for (int j = 0; j < m; ++j) stream.zig(int64_t(j % keys) - 0); // lane deltas vs lane0=0
+    for (int j = 0; j < m; ++j) stream.var(uint64_t((j / keys) % 2)); // attr: side
+    for (int j = 0; j < m; ++j) stream.var(0);                    // type
+    for (int j = 0; j < m; ++j) stream.var(stack);                // stack
+
+    // Pattern section: u32 count + [u64 spanUs, u8 hasPitch, u32 len, bytes] + u32 crc
+    SBuf pat;
+    pat.u32(1);
+    pat.u64(uint64_t(periodUs));   // spanUs = repeat stride
+    pat.u8(1);                     // hasPitch
+    pat.u32(uint32_t(stream.b.size()));
+    pat.raw(stream.b.data(), stream.b.size());
+    uint32_t pcrc = scrc(pat.b.data(), pat.b.size());
+    pat.u32(pcrc);
+
+    // Chunk payload (sealed): u32 opCount + ops + u64 expanded.
+    // op = kOpPattern{pid=0, reps, anchor=0, pitchDelta=60, laneDelta=0}
+    SBuf pay;
+    pay.u32(1);
+    pay.u8(2);                     // kOpPattern
+    pay.u32(0);                    // pattern id
+    pay.u32(uint32_t(reps));
+    pay.zig(0);                    // anchorUs
+    pay.zig(60);                   // pitchDelta -> pitchBase 60, pitch0 60 => pitch 60
+    pay.zig(0);                    // laneDelta
+    pay.u64(expanded);
+
+    raid::DocChunkOut chunk;
+    chunk.payload.assign(pay.b.begin(), pay.b.end());
+    chunk.firstEvent = 0;
+    chunk.firstTimeUs = 0;
+    chunk.lastTimeUs = int64_t(reps - 1) * periodUs + int64_t(m - 1) * localStep;
+    chunk.expanded = uint32_t(expanded);
+    chunk.opCount = 1;
+    std::vector<raid::DocChunkOut> chunks{chunk};
+
+    Chart meta;
+    meta.title = "stress";
+    meta.difficulty = "Stress";
+    meta.keys = keys;
+    meta.tempo.push_back({0, 120});
+    meta.lengthMs = double(chunk.lastTimeUs) / 1000.0;
+    raid::EncodeOptions opt;
+    raid::Info info;
+    std::string err;
+    if (!raid::writeRaidDoc(out, pat.b, chunks, expanded, 0, m,
+                            uint64_t(m) * stack, raid::chartMetaJson(meta),
+                            opt, &info, err)) {
+        std::printf("writeRaidDoc failed: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("wrote %s: reps=%llu motif=%d period=%.1fms expanded=%llu stack=%u\n",
+                out.c_str(), (unsigned long long)reps, m, periodMs,
+                (unsigned long long)expanded, stack);
+    return 0;
+}
+
+// eval: lazy windowed-decode benchmark. Times Reader::rangeWindow over a
+// fixed [startMs,endMs) window and reports decode-work counters — the
+// whole point is repeatsSkipped vs repeatsIterated. With "verify", also
+// runs Reader::range (whole-chunk reference) and diffs events+indices.
+//   raid_engine eval <file.raid> <startMs> <endMs> [iters] [verify]
+static int evalCmd(const std::string& path, const std::string& startMs,
+                   const std::string& endMs, int iters, bool verify) {
+    raid::Reader rd;
+    std::string err;
+    if (!rd.open(path, err)) { std::printf("open failed: %s\n", err.c_str()); return 1; }
+    const int64_t sUs = int64_t(std::llround(std::atof(startMs.c_str()) * 1000.0));
+    const int64_t eUs = int64_t(std::llround(std::atof(endMs.c_str()) * 1000.0));
+    if (eUs <= sUs) { std::printf("empty window\n"); return 1; }
+
+    const raid::EvalStats st0 = rd.evalStats();
+    std::vector<raid::Event> evs;
+    std::vector<uint64_t> idx;
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t total = 0;
+    for (int i = 0; i < iters; ++i) {
+        evs.clear(); idx.clear();
+        if (!rd.rangeWindow(sUs, eUs, evs, idx, err)) {
+            std::printf("rangeWindow failed: %s\n", err.c_str());
+            return 1;
+        }
+        total += evs.size();
+    }
+    const double secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    const raid::EvalStats st1 = rd.evalStats();
+
+    const uint64_t dLeaf = st1.leafInstances.load() - st0.leafInstances.load();
+    const uint64_t dFall = st1.leafFallbacks.load() - st0.leafFallbacks.load();
+    const uint64_t dIter = st1.repeatsIterated.load() - st0.repeatsIterated.load();
+    const uint64_t dSkip = st1.repeatsSkipped.load() - st0.repeatsSkipped.load();
+    const uint64_t dOps = st1.opsDecoded.load() - st0.opsDecoded.load();
+    std::printf("eval %s [%lld,%lld)ms x%d: %llu events, %.2f ms total, %.1f ev/ms\n",
+                path.c_str(), (long long)sUs / 1000, (long long)eUs / 1000, iters,
+                (unsigned long long)(total / iters), secs * 1000.0,
+                total / std::max(1e-9, secs * 1000.0));
+    std::printf("  leafInstances=%llu fallbacks=%llu opsDecoded=%llu\n",
+                (unsigned long long)dLeaf, (unsigned long long)dFall,
+                (unsigned long long)dOps);
+    std::printf("  repeats: iterated=%llu skipped=%llu (%.1f%% bypassed)\n",
+                (unsigned long long)dIter, (unsigned long long)dSkip,
+                dIter + dSkip ? 100.0 * dSkip / (dIter + dSkip) : 0.0);
+
+    if (verify) {
+        std::vector<raid::Event> ref;
+        std::vector<uint64_t> refIdx;
+        if (!rd.range(sUs, eUs, ref, err, &refIdx)) {
+            std::printf("range failed: %s\n", err.c_str());
+            return 1;
+        }
+        bool same = ref.size() == evs.size() && refIdx == idx;
+        if (same) {
+            for (size_t i = 0; i < ref.size(); ++i) {
+                const raid::Event& a = ref[i];
+                const raid::Event& b = evs[i];
+                if (a.timeUs != b.timeUs || a.lengthUs != b.lengthUs ||
+                    a.pitch != b.pitch || a.lane != b.lane || a.side != b.side ||
+                    a.kind != b.kind || a.flags != b.flags || a.type != b.type ||
+                    a.stack != b.stack) { same = false; break; }
+            }
+        }
+        std::printf("verify vs range(): %s (%llu vs %llu events)\n",
+                    same ? "MATCH" : "MISMATCH",
+                    (unsigned long long)ref.size(), (unsigned long long)evs.size());
+        if (!same) return 2;
+    }
+    rd.close();
     return 0;
 }
 
@@ -1444,6 +1811,9 @@ int main(int argc, char** argv) {
                     "  raid_engine streamtest <file.raid>\n"
                     "  raid_engine bench <file.raid> [jobs]\n"
                     "  raid_engine slicebench <file.raid>\n"
+                    "  raid_engine eval <file.raid> <startMs> <endMs> [iters] [verify]\n"
+                    "  raid_engine repgen <out.raid> <repeats> <motif> <periodMs> [chunkEv] [stack] [keys]\n"
+                    "  raid_engine stressgen <out.raid> <repeats> <motif> <periodMs> [stack] [keys]\n"
                     "  raid_engine densgen <out.raid> <sec> <evPerSec> <chunkEvents> [susEvery] [overlapEvery] [keys]\n"
                     "  raid_engine densbench <file.raid>\n"
                     "  raid_engine rchr pack|list|unpack ...\n"
@@ -1480,7 +1850,13 @@ int main(int argc, char** argv) {
     if (cmd == "meta" && argc >= 3) return meta(argv[2]);
     if (cmd == "streamtest" && argc >= 3) return streamtest(argv[2]);
     if (cmd == "slicebench" && argc >= 3) return slicebench(argv[2]);
+    if (cmd == "eval" && argc >= 5)
+        return evalCmd(argv[2], argv[3], argv[4],
+                       argc > 5 ? std::atoi(argv[5]) : 1,
+                       argc > 6 && std::string(argv[6]) == "verify");
     if (cmd == "densgen" && argc >= 6) return densgen(argc, argv);
+    if (cmd == "repgen" && argc >= 6) return repgen(argc, argv);
+    if (cmd == "stressgen" && argc >= 6) return stressgen(argc, argv);
     if (cmd == "densbench" && argc >= 3)
         return densbench(argv[2], argc >= 4 && std::string(argv[3]) == "rt",
                         argc >= 5 ? std::strtoull(argv[4], nullptr, 10) : 0);
@@ -1492,6 +1868,7 @@ int main(int argc, char** argv) {
     if (cmd == "patterns" && argc >= 3)
         return patterns(argv[2], argc >= 4 ? argv[3] : nullptr,
                         argc >= 5 ? argv[4] : nullptr);
+    if (cmd == "flppatterns" && argc >= 3) return flppatterns(argv[2]);
     if (cmd == "raidedit" && argc >= 3) return raidedit(argc, argv);
     if (cmd == "upgrade" && argc >= 3) return upgradeCmd(argc - 2, argv + 2);
     std::printf("unknown or incomplete command\n");

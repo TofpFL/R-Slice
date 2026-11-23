@@ -291,6 +291,11 @@ struct EmitOut {
     int64_t qLo = INT64_MIN, qHi = INT64_MAX;
     std::vector<uint64_t>* indices = nullptr;
     uint64_t indexBase = 0;  // added to every emitted index (chunk firstEvent)
+    EvalStats* stats = nullptr;  // optional decode-work counters
+    // Set when an absolute literal (kOpLiteralAbs) is decoded: those times
+    // ignore ctx.timeBase, so they do NOT shift per pattern repeat. The
+    // cached-leaf fast path requires uniformly shifting events.
+    bool sawAbsLiteral = false;
 };
 
 // Appends one event plus its output-sequence index (when requested).
@@ -324,6 +329,7 @@ constexpr int64_t kFieldBound = int64_t(1) << 40;
 
 bool emitLiteral(Cur& cur, bool relative, const PatternRec* pat, const Ctx& ctx,
                  EmitOut& eo, std::string& err) {
+    if (!relative) eo.sawAbsLiteral = true;
     uint32_t n = uint32_t(cur.u32());
     if (!cur.ok || n == 0 || n > (1u << 24)) { err = "bad literal count"; return false; }
     // Column decode needs all n events buffered before fields interleave.
@@ -425,6 +431,22 @@ bool emitLiteral(Cur& cur, bool relative, const PatternRec* pat, const Ctx& ctx,
     return true;
 }
 
+// floor/ceil division by a positive int64 divisor. Numerators are produced
+// by satSub so they cannot overflow; quotients fit int64 and callers clamp
+// to the repeat domain anyway.
+static inline int64_t floorDiv64(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    if (a % b < 0) --q;
+    return q;
+}
+static inline int64_t ceilDiv64(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    if (a % b > 0) ++q;
+    return q;
+}
+// a + 1 saturated at INT64_MAX (used for exclusive range ends).
+static inline int64_t satInc(int64_t a) { return a == INT64_MAX ? a : a + 1; }
+
 // Leaf-pattern instance expansion for sliced decode. A leaf pattern's op
 // stream contains only literals, so its expansion is a fixed local event
 // list: decode it once at the repeat-0 transform, then serve every repeat
@@ -437,8 +459,10 @@ int emitLeafCached(const Env& env, const PatternRec& child, int64_t unit,
                    int64_t laneDelta, const Ctx& ctx, int depth,
                    EmitOut& eo, std::string& err) {
     std::vector<Event> pat;
+    bool absLit = false;
     {
         EmitOut pe{&pat, 0, kMaxChunkExpand};
+        pe.stats = eo.stats;
         Ctx pc{ctx.timeBase + anchor, ctx.pitchBase + pitchDelta,
                ctx.laneBase + laneDelta, INT64_MIN, INT64_MAX};
         Cur cc{env.blob->data() + child.off, env.blob->data() + child.off + child.len};
@@ -446,17 +470,25 @@ int emitLeafCached(const Env& env, const PatternRec& child, int64_t unit,
             if (err == "chunk expands beyond its declared size") { err.clear(); return 1; }
             return -1;
         }
+        absLit = pe.sawAbsLiteral;
     }
+    // Absolute literals do not shift with the repeat stride, so the
+    // arithmetic path is only valid for uniformly-relative leaves.
+    if (absLit) return 1;
     // Binary search below requires sorted local times; the format's output
     // order guarantees it, but a pathological pattern falls back safely.
     for (size_t i = 1; i < pat.size(); ++i)
         if (pat[i].timeUs < pat[i - 1].timeUs) return 1;
+    if (pat.empty()) return 0;  // every repeat keeps 0 events; nothing to do
     auto cmp = [](const Event& e, int64_t v) { return e.timeUs < v; };
-    for (uint32_t r = 0; r < reps; ++r) {
+
+    // One repeat's expansion: clip-window kept count, limit check, windowed
+    // emission, produced accounting. Identical to the reference loop body.
+    auto runRepeat = [&](uint32_t r) -> int {
         const int64_t shift = int64_t(r) * unit;
         // Reference emitLiteral rejects a negative first-event time per
         // repeat; pat.front() is the minimum (sortedness checked above).
-        if (!pat.empty() && pat.front().timeUs + shift < 0) {
+        if (pat.front().timeUs + shift < 0) {
             err = "negative event time";
             return -1;
         }
@@ -481,6 +513,86 @@ int emitLeafCached(const Env& env, const PatternRec& child, int64_t unit,
             }
         }
         eo.produced += kept;
+        return 0;
+    };
+
+    // Lazy path: with a positive stride, repeats are evenly spaced, so the
+    // repeats that can emit (playback window ∩ clip window) form one
+    // contiguous range computable in O(1). Everything outside it either
+    // keeps zero events or is bulk-accounted in O(pattern size) — the
+    // difference between O(repeats) and O(repeats-in-window) work.
+    if (unit > 0 && reps > 0) {
+        if (eo.stats) ++eo.stats->leafInstances;
+        const int64_t L = int64_t(pat.size());
+        // The reference loop runs every repeat through runRepeat, whose
+        // first check rejects a negative first-event time. With unit > 0
+        // that time is nondecreasing in r, so a negative can only occur at
+        // r = 0 (pat.front() already includes the repeat-0 transform).
+        if (pat.front().timeUs < 0) {
+            err = "negative event time";
+            return -1;
+        }
+        // Repeat r can emit only if [r*unit + front, r*unit + back] meets
+        // [qLo, qHi); it can keep clip events only if it meets
+        // [clipLo, clipHi). Integer times make t < hi equivalent to
+        // t <= hi - 1. Unbounded sides saturate to the repeat domain.
+        const int64_t eLo = ceilDiv64(satSub(eo.qLo, pat.back().timeUs), unit);
+        const int64_t eHi = satInc(floorDiv64(satSub(satSub(eo.qHi, 1),
+                                                       pat.front().timeUs), unit));
+        const int64_t cLo = ceilDiv64(satSub(ctx.clipLo, pat.back().timeUs), unit);
+        const int64_t cHi = satInc(floorDiv64(satSub(satSub(ctx.clipHi, 1),
+                                                       pat.front().timeUs), unit));
+        auto clampR = [&](int64_t v) -> int64_t {
+            if (v < 0) return 0;
+            if (v > int64_t(reps)) return int64_t(reps);
+            return v;
+        };
+        const int64_t rLo = clampR(eLo > cLo ? eLo : cLo);
+        int64_t rHi = clampR(eHi < cHi ? eHi : cHi);
+        if (rHi < rLo) rHi = rLo;
+
+        // Exact kept(r) summed over repeat range [a,b) in O(L): each
+        // pattern event survives the clip window for a contiguous j range.
+        auto keptSum = [&](int64_t a, int64_t b) -> uint64_t {
+            if (b <= a || L == 0) return 0;
+            if (ctx.clipLo == INT64_MIN && ctx.clipHi == INT64_MAX)
+                return uint64_t(b - a) * uint64_t(L);
+            uint64_t sum = 0;
+            for (const Event& e : pat) {
+                const int64_t lo = ceilDiv64(satSub(ctx.clipLo, e.timeUs), unit);
+                const int64_t hi = ceilDiv64(satSub(ctx.clipHi, e.timeUs), unit);
+                const int64_t l = lo > a ? lo : a;
+                const int64_t h = hi < b ? hi : b;
+                if (h > l) sum += uint64_t(h - l);
+            }
+            return sum;
+        };
+
+        uint64_t skipped = keptSum(0, rLo);
+        if (eo.produced + skipped > eo.limit) {
+            err = "chunk expands beyond its declared size";
+            return -1;
+        }
+        eo.produced += skipped;
+        for (int64_t r = rLo; r < rHi; ++r) {
+            if (runRepeat(uint32_t(r)) < 0) return -1;
+            if (eo.stats) ++eo.stats->repeatsIterated;
+        }
+        skipped = keptSum(rHi, reps);
+        if (eo.produced + skipped > eo.limit) {
+            err = "chunk expands beyond its declared size";
+            return -1;
+        }
+        eo.produced += skipped;
+        if (eo.stats) eo.stats->repeatsSkipped += uint64_t(rLo) + uint64_t(reps - rHi);
+        return 0;
+    }
+
+    // Reference loop: non-positive strides and unbounded edge cases.
+    if (eo.stats) { ++eo.stats->leafInstances; ++eo.stats->leafFallbacks; }
+    for (uint32_t r = 0; r < reps; ++r) {
+        if (runRepeat(r) < 0) return -1;
+        if (eo.stats) ++eo.stats->repeatsIterated;
     }
     return 0;
 }
@@ -493,6 +605,7 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
     for (uint32_t o = 0; o < opCount; ++o) {
         uint8_t kind = cur.u8();
         if (!cur.ok) { err = "truncated op"; return false; }
+        if (eo.stats) ++eo.stats->opsDecoded;
         if (kind == kOpLiteralAbs) {
             if (!emitLiteral(cur, false, nullptr, ctx, eo, err)) return false;
         } else if (kind == kOpLiteralRel) {
@@ -622,6 +735,7 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
                 const GEnt& ge = ents[i];
                 const size_t start = arena.size();
                 EmitOut sub{&arena, 0, budget};
+                sub.stats = eo.stats;
                 for (uint32_t r = 0; r < ge.reps; ++r) {
                     Ctx sctx{ctx.timeBase + ge.anchor + int64_t(r) * int64_t(ge.child->spanUs),
                              ctx.pitchBase + ge.pd, ctx.laneBase + ge.ld, ge.lo, ge.hi};
@@ -2385,6 +2499,7 @@ struct Reader::Impl {
     // missed the LRU, actual chunk decodes, and raw payload bytes decoded.
     std::atomic<uint64_t> cacheHits_{0}, cacheMisses_{0};
     std::atomic<uint64_t> chunkDecodes_{0}, bytesDecoded_{0};
+    EvalStats evalStats_;   // lazy-decode work counters (see raid.hpp)
 
     Semaphore decSem_;
     int decTotal_ = 2;
@@ -2650,6 +2765,7 @@ struct Reader::Impl {
         Env env{&patternBlob_, &patterns_};
         Ctx ctx{};
         EmitOut eo{&out, 0, e.expanded};
+        eo.stats = &evalStats_;
         if (!emitOps(cur, env, nullptr, ctx, 0, eo, err)) {
             out.resize(before);
             return false;
@@ -2859,6 +2975,7 @@ struct Reader::Impl {
         Env env{&patternBlob_, &patterns_, &patHasInst_};
         Ctx ctx{};
         EmitOut eo{&out, 0, e.expanded, qLo, qHi, &indices, e.firstEvent};
+        eo.stats = &evalStats_;
         if (!emitOps(cur, env, nullptr, ctx, 0, eo, err)) {
             out.resize(before);
             indices.resize(beforeIdx);
@@ -2983,6 +3100,12 @@ void Reader::cacheStats(uint64_t& hits, uint64_t& misses,
     misses = impl_->cacheMisses_.load(std::memory_order_relaxed);
     decodes = impl_->chunkDecodes_.load(std::memory_order_relaxed);
     bytesDecoded = impl_->bytesDecoded_.load(std::memory_order_relaxed);
+}
+
+EvalStats Reader::evalStats() const {
+    EvalStats s;
+    if (impl_) s.add(impl_->evalStats_);
+    return s;
 }
 
 bool Reader::uniqueStats(uint64_t& events, uint64_t& notes, std::string& err) {
