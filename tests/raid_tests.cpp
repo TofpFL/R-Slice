@@ -15,6 +15,7 @@
 #include "chart.hpp"
 #include "chart_stream.hpp"
 #include "common.hpp"
+#include "engine_abi.h"
 #include "flp_import.hpp"
 #include "raid.hpp"
 #include "raid_chart.hpp"
@@ -1027,6 +1028,108 @@ void testSlicedRange() {
     }
 }
 
+// gh_engine_seek: section skips must rewind the feed exactly — no stale
+// pre-seek events, no missing events, ids stay the global expanded indices.
+// Simulates PlayState's poll loop (poll until caught up, step song time).
+void testEngineSeek() {
+    const std::string file = tmpPath("gh_raid_seek.raid");
+    Chart c;
+    c.keys = 4;
+    c.tempo.push_back({0, 120});
+    for (int i = 0; i < 3000; ++i) {
+        Note n;
+        n.time = 100.0 + i * 20.0;  // ~60 s chart
+        n.lane = i % 4;
+        n.side = (i / 4) % 2;
+        n.length = (i % 9 == 0) ? 250.0 : 0.0;
+        n.stack = uint16_t(1 + (i % 5 == 0 ? 2 : 0));
+        c.notes.push_back(n);
+    }
+    c.finalize(120);
+    raid::EncodeOptions opt;
+    raid::Info info;
+    std::string err;
+    RCHECK(raid::saveChart(file, c, opt, &info, err));
+
+    char ebuf[256];
+    void* eng = gh_engine_open(file.c_str(), ebuf, sizeof(ebuf));
+    RCHECK(eng != nullptr);
+
+    raid::Reader rd;
+    RCHECK(rd.open(file, err));
+
+    struct Emitted { double t; uint64_t id; };
+    std::vector<GhGameplayEvent> buf(8192);
+    std::vector<Emitted> out;
+
+    // Poll at song time `t` until the feed has drained (bounded iterations
+    // cover the 4 s lookahead at 150 ms of feed per poll).
+    auto drain = [&](double t) {
+        for (int iter = 0; iter < 64; ++iter) {
+            const size_t n = gh_engine_poll(eng, buf.data(), buf.size(), t);
+            for (size_t i = 0; i < n; ++i)
+                out.push_back({buf[i].timeMs, buf[i].id});
+            if (n < buf.size()) {
+                // A short read means pending drained; keep polling a few
+                // more times only if the feed may still be fetching — the
+                // loop bound covers it, empty polls are cheap.
+            }
+        }
+    };
+    auto playRange = [&](double fromMs, double toMs) {
+        const size_t mark = out.size();
+        for (double t = fromMs; t <= toMs; t += 100.0) drain(t);
+        return mark;
+    };
+    // Emitted ids must form a prefix of the reference decode of the same
+    // span, and times must be non-decreasing (feed order = time order).
+    auto checkSpan = [&](size_t begin, int64_t refLoUs, int64_t refHiUs) {
+        std::vector<raid::Event> ref;
+        std::vector<uint64_t> refIdx;
+        RCHECK(rd.rangeWindow(refLoUs, refHiUs, ref, refIdx, err));
+        RCHECK(refIdx.size() >= out.size() - begin);
+        size_t bad = 0;
+        double prevT = -1e18;
+        for (size_t i = begin; i < out.size(); ++i) {
+            if (i - begin >= refIdx.size() || out[i].id != refIdx[i - begin]) ++bad;
+            if (out[i].t < prevT) ++bad;
+            prevT = out[i].t;
+        }
+        RCHECK(bad == 0);
+    };
+
+    // Phase 1: play 0 -> 10 s.
+    size_t p1 = playRange(-500.0, 10000.0);
+    checkSpan(p1, -500'000, 14'500'000);
+
+    // Phase 2: forward section skip to 30 s — nothing before ~30 s may emit.
+    RCHECK(gh_engine_seek(eng, 30000.0) == 0);
+    size_t p2 = playRange(30000.0, 35000.0);
+    RCHECK(out.size() > p2);
+    RCHECK(out[p2].t >= 29999.0);
+    checkSpan(p2, 30'000'000, 39'500'000);
+
+    // Phase 3: backward skip to 8 s — the feed must rewind and re-emit the
+    // same global ids the reference decode produces for that span.
+    RCHECK(gh_engine_seek(eng, 8000.0) == 0);
+    size_t p3 = playRange(8000.0, 12000.0);
+    RCHECK(out.size() > p3);
+    RCHECK(out[p3].t >= 7999.0);
+    checkSpan(p3, 8'000'000, 16'500'000);
+
+    // Phase 4: seek into the middle of an already-fed region must not
+    // duplicate events the forward pass already emitted.
+    RCHECK(gh_engine_seek(eng, 34000.0) == 0);
+    size_t p4 = playRange(34000.0, 36000.0);
+    RCHECK(out.size() > p4);
+    RCHECK(out[p4].t >= 33999.0);
+    checkSpan(p4, 34'000'000, 40'500'000);
+
+    gh_engine_close(eng);
+    rd.close();
+    std::filesystem::remove(file);
+}
+
 }  // namespace
 
 void runRaidTests() {
@@ -1045,6 +1148,7 @@ void runRaidTests() {
     testEncoderValidation();
     testMalformed();
     testConcurrentAndBudget();
+    testEngineSeek();
 }
 
 // gh_tests --raid <input> <output.raid>: converts any chart loadChartFile

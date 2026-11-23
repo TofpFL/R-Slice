@@ -275,8 +275,13 @@ struct Env {
     const std::vector<char>* blob = nullptr;   // pattern section payload
     const std::vector<PatternRec>* pats = nullptr;
     // patHasInst[i]: pattern i's op stream contains pattern ops (it is not
-    // a leaf). Only used by the op-log walker; emitOps ignores it.
+    // a leaf). Only used by the op-log walker.
     const std::vector<uint8_t>* hasInst = nullptr;
+    // patUniform[i]: pattern i's expansion shifts rigidly with the repeat
+    // stride — no kOpGroup anywhere in its transitive op closure (group
+    // entries clip by absolute time, which does not shift per repeat).
+    // Absolute literals are still rejected dynamically via sawAbsLiteral.
+    const std::vector<uint8_t>* uniform = nullptr;
 };
 // (blob->size() bounds every PatternRec.off + len)
 
@@ -632,8 +637,8 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
             }
             if (reps > eo.limit) { err = "pattern repeat count too large"; return false; }
             bool done = false;
-            if (reps && env.hasInst && pid < env.hasInst->size() &&
-                !(*env.hasInst)[pid]) {
+            if (reps && env.uniform && pid < env.uniform->size() &&
+                (*env.uniform)[pid]) {
                 const int rc = emitLeafCached(env, child, int64_t(child.spanUs),
                                               reps, anchor, pitchDelta, laneDelta,
                                               ctx, depth, eo, err);
@@ -671,8 +676,8 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
             }
             if (reps > eo.limit) { err = "pattern repeat count too large"; return false; }
             bool done = false;
-            if (reps && env.hasInst && pid < env.hasInst->size() &&
-                !(*env.hasInst)[pid]) {
+            if (reps && env.uniform && pid < env.uniform->size() &&
+                (*env.uniform)[pid]) {
                 const int rc = emitLeafCached(env, child, stride, reps,
                                               anchor, pitchDelta, laneDelta,
                                               ctx, depth, eo, err);
@@ -692,6 +697,7 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
             if (!cur.ok || nEnt == 0 || nEnt > 4096) { err = "bad group count"; return false; }
             struct GEnt {
                 const PatternRec* child;
+                uint32_t pid;
                 uint32_t reps;
                 int64_t anchor, pd, ld, lo, hi;
             };
@@ -717,7 +723,7 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
                     return false;
                 }
                 if (reps > eo.limit) { err = "pattern repeat count too large"; return false; }
-                ents.push_back({&child, reps, anchor, pd, ld, lo, hi});
+                ents.push_back({&child, pid, reps, anchor, pd, ld, lo, hi});
             }
             // Expand each entry independently (entries may overlap â€” that is
             // the point of the op), then k-way merge the sorted runs into
@@ -736,6 +742,22 @@ bool emitOps(Cur& cur, const Env& env, const PatternRec* pat, const Ctx& ctx,
                 const size_t start = arena.size();
                 EmitOut sub{&arena, 0, budget};
                 sub.stats = eo.stats;
+                // Uniform-shift children (no transitive group ops) decode
+                // once and skip irrelevant repeats arithmetically; the
+                // entry's absolute clip window becomes the ctx clip.
+                bool done = false;
+                if (ge.reps && env.uniform && ge.pid < env.uniform->size() &&
+                    (*env.uniform)[ge.pid]) {
+                    Ctx gctx{ctx.timeBase, ctx.pitchBase, ctx.laneBase,
+                             ge.lo, ge.hi};
+                    const int rc = emitLeafCached(env, *ge.child,
+                                                  int64_t(ge.child->spanUs),
+                                                  ge.reps, ge.anchor, ge.pd,
+                                                  ge.ld, gctx, depth, sub, err);
+                    if (rc < 0) return false;
+                    done = (rc == 0);
+                }
+                if (!done)
                 for (uint32_t r = 0; r < ge.reps; ++r) {
                     Ctx sctx{ctx.timeBase + ge.anchor + int64_t(r) * int64_t(ge.child->spanUs),
                              ctx.pitchBase + ge.pd, ctx.laneBase + ge.ld, ge.lo, ge.hi};
@@ -844,6 +866,52 @@ bool scanPatternOps(Cur& cur, bool& hasInst, uint64_t& ev, uint64_t& notes,
             if (!cur.ok || nEnt == 0 || nEnt > 4096) { err = "bad group count"; return false; }
             for (uint32_t i = 0; i < nEnt; ++i) {
                 // 2 x u32 + 5 zigzag per entry.
+                (void)cur.u32(); (void)cur.u32();
+                for (int z = 0; z < 5; ++z) (void)cur.var();
+                if (!cur.ok) { err = "truncated group op"; return false; }
+            }
+        } else {
+            err = "unknown op kind";
+            return false;
+        }
+    }
+    return cur.ok;
+}
+
+// Scans one pattern def's op stream for group ops and instance references.
+// Unlike scanPatternOps this does not count events — it only needs the op
+// kinds and child pattern ids to prove (or disprove) uniform time shifts.
+// Fills `refs` with every pattern/burst child pid in op order.
+bool scanPatternGroupInfo(Cur& cur, bool& hasGroup,
+                          std::vector<uint32_t>& refs, std::string& err) {
+    hasGroup = false;
+    refs.clear();
+    uint32_t opCount = uint32_t(cur.u32());
+    if (!cur.ok || opCount > (1u << 22)) { err = "bad op count"; return false; }
+    for (uint32_t o = 0; o < opCount; ++o) {
+        uint8_t kind = cur.u8();
+        if (!cur.ok) { err = "truncated op"; return false; }
+        if (kind == kOpLiteralAbs || kind == kOpLiteralRel) {
+            uint32_t n = uint32_t(cur.u32());
+            if (!cur.ok || n == 0 || n > (1u << 24)) { err = "bad literal count"; return false; }
+            for (uint32_t k = 0; k < n; ++k) { (void)cur.var(); if (!cur.ok) { err = "truncated literal"; return false; } }
+            for (int col = 0; col < 6; ++col)
+                for (uint32_t k = 0; k < n; ++k) {
+                    (void)cur.var();
+                    if (!cur.ok) { err = "truncated literal"; return false; }
+                }
+        } else if (kind == kOpPattern || kind == kOpBurst) {
+            const uint32_t pid = uint32_t(cur.u32());
+            (void)cur.u32();  // reps
+            const int zig = kind == kOpPattern ? 3 : 4;
+            for (int z = 0; z < zig; ++z) (void)cur.var();
+            if (!cur.ok) { err = "truncated pattern op"; return false; }
+            refs.push_back(pid);
+        } else if (kind == kOpGroup) {
+            hasGroup = true;
+            uint32_t nEnt = uint32_t(cur.u32());
+            if (!cur.ok || nEnt == 0 || nEnt > 4096) { err = "bad group count"; return false; }
+            for (uint32_t i = 0; i < nEnt; ++i) {
                 (void)cur.u32(); (void)cur.u32();
                 for (int z = 0; z < 5; ++z) (void)cur.var();
                 if (!cur.ok) { err = "truncated group op"; return false; }
@@ -2481,6 +2549,7 @@ struct Reader::Impl {
     std::vector<char> patternBlob_;
     std::vector<PatternRec> patterns_;
     std::vector<uint8_t> patHasInst_;  // pattern ops contain nested instances
+    std::vector<uint8_t> patUniform_;  // expansion shifts rigidly per repeat
     uint64_t patUniqueEvents_ = 0;    // literal events stored in defs
     uint64_t patUniqueNotes_ = 0;     // their stack-weighted note total
 
@@ -2728,6 +2797,75 @@ struct Reader::Impl {
         }
         patUniqueEvents_ = pev;
         patUniqueNotes_ = pnotes;
+
+        // patUniform_[i]: pattern i's expansion is invariant under the
+        // per-repeat time shift, so emitLeafCached may decode it once and
+        // skip repeats arithmetically. Unsafe iff a kOpGroup appears anywhere
+        // in its transitive instance closure — group entries clip by absolute
+        // time, which does not shift with the repeat stride. Absolute
+        // literals need no flag here: EmitOut::sawAbsLiteral rejects them
+        // dynamically at decode time. Unparseable defs stay unsafe.
+        patUniform_.assign(patterns_.size(), 0);
+        {
+            const size_t np = patterns_.size();
+            std::vector<std::vector<uint32_t>> refs(np);
+            std::vector<uint8_t> selfGroup(np, 0);
+            bool scanOk = true;
+            for (size_t i = 0; i < np && scanOk; ++i) {
+                const PatternRec& p = patterns_[i];
+                Cur pc{patternBlob_.data() + p.off,
+                       patternBlob_.data() + p.off + p.len};
+                bool hg = false;
+                std::string gerr;
+                if (!scanPatternGroupInfo(pc, hg, refs[i], gerr)) {
+                    scanOk = false;
+                } else {
+                    selfGroup[i] = hg ? 1 : 0;
+                }
+            }
+            if (scanOk) {
+                // Iterative post-order DFS; state 0 unvisited, 1 on stack,
+                // 2 uniform, 3 unsafe. A back-edge (cycle) or a group op
+                // anywhere below marks the whole chain unsafe.
+                std::vector<uint8_t> state(np, 0);
+                struct Frame { uint32_t pid; size_t ri; };
+                std::vector<Frame> st;
+                for (uint32_t root = 0; root < np; ++root) {
+                    if (state[root]) continue;
+                    st.push_back({root, 0});
+                    state[root] = 1;
+                    while (!st.empty()) {
+                        Frame& f = st.back();
+                        if (selfGroup[f.pid]) {
+                            state[f.pid] = 3;
+                            st.pop_back();
+                            continue;
+                        }
+                        const auto& ch = refs[f.pid];
+                        if (f.ri < ch.size()) {
+                            const uint32_t c = ch[f.ri];
+                            if (c >= np) { state[f.pid] = 3; st.pop_back(); continue; }
+                            if (state[c] == 0) {
+                                state[c] = 1;
+                                st.push_back({c, 0});
+                                continue;  // re-examine f.ri after child resolves
+                            }
+                            if (state[c] == 1 || state[c] == 3) {
+                                state[f.pid] = 3;
+                                st.pop_back();
+                                continue;
+                            }
+                            ++f.ri;  // state[c] == 2: clean
+                            continue;
+                        }
+                        state[f.pid] = 2;
+                        st.pop_back();
+                    }
+                }
+                for (size_t i = 0; i < np; ++i)
+                    patUniform_[i] = state[i] == 2 ? 1 : 0;
+            }
+        }
         return true;
     }
 
@@ -2976,7 +3114,7 @@ struct Reader::Impl {
 
         const size_t before = out.size(), beforeIdx = indices.size();
         Cur cur{payload.data(), payload.data() + payload.size()};
-        Env env{&patternBlob_, &patterns_, &patHasInst_};
+        Env env{&patternBlob_, &patterns_, &patHasInst_, &patUniform_};
         Ctx ctx{};
         EmitOut eo{&out, 0, e.expanded, qLo, qHi, &indices, e.firstEvent};
         eo.stats = &evalStats_;
