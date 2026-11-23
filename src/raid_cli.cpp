@@ -620,6 +620,64 @@ static int repgen(int argc, char** argv) {
     return 0;
 }
 
+// litgen: literal-heavy chart for chunk-size benchmarking. Pseudo-random
+// lanes/sides/times defeat the encoder's pattern matcher, so chunks hold
+// literal ops — the worst case for large-chunk windowed decode.
+//   raid_engine litgen <out.raid> <events> <durationMs> <chunkEvents> [keys]
+static int litgen(int argc, char** argv) {
+    if (argc < 6) {
+        std::printf("usage: raid_engine litgen <out.raid> <events> <durationMs>"
+                    " <chunkEvents> [keys]\n");
+        return 1;
+    }
+    const std::string out = argv[2];
+    const uint64_t n = std::strtoull(argv[3], nullptr, 10);
+    const double durMs = std::atof(argv[4]);
+    const uint32_t chunkEvents = uint32_t(std::strtoul(argv[5], nullptr, 10));
+    const int keys = argc > 6 ? std::atoi(argv[6]) : 4;
+    if (n == 0 || n > 8000000ull || durMs <= 0) {
+        std::printf("bad params (events 1..8M, durationMs>0)\n");
+        return 1;
+    }
+    std::vector<raid::Event> evs;
+    evs.reserve(size_t(n));
+    const double stepMs = durMs / double(n);
+    uint64_t h = 0x243F6A8885A308D3ull;
+    auto rnd = [&] { h ^= h << 13; h ^= h >> 7; h ^= h << 17; return h; };
+    for (uint64_t i = 0; i < n; ++i) {
+        raid::Event e;
+        e.timeUs = int64_t(i * stepMs * 1000.0 + double(rnd() % 900));
+        e.lengthUs = 0;
+        e.lane = uint8_t(rnd() % uint64_t(keys));
+        e.side = uint8_t(rnd() & 1);
+        e.kind = 0;
+        e.stack = 1;
+        evs.push_back(e);
+    }
+    Chart meta;
+    meta.title = "litstress";
+    meta.difficulty = "Stress";
+    meta.keys = keys;
+    meta.tempo.push_back({0, 120});
+    meta.lengthMs = durMs;
+    raid::EncodeOptions opt;
+    opt.chunkEvents = chunkEvents;
+    raid::Info info;
+    std::string err;
+    if (!raid::writeRaid(out, evs, raid::chartMetaJson(meta), opt, &info, err)) {
+        std::printf("encode failed: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("wrote %s: %llu events -> %llu logical, %llu chunks,"
+                " %llu patterns (%.1f MB)\n",
+                out.c_str(), (unsigned long long)n,
+                (unsigned long long)info.logicalEvents,
+                (unsigned long long)info.chunkCount,
+                (unsigned long long)info.patternCount,
+                double(std::filesystem::file_size(out)) / 1048576.0);
+    return 0;
+}
+
 // ---- stressgen: hand-authored giant pattern instance -------------------
 // Builds a .raid whose single chunk is one kOpPattern op referencing a
 // small leaf literal, with an arbitrary repeat count — the shape real
@@ -825,6 +883,153 @@ static int evalCmd(const std::string& path, const std::string& startMs,
                     (unsigned long long)ref.size(), (unsigned long long)evs.size());
         if (!same) return 2;
     }
+    rd.close();
+    return 0;
+}
+
+// chunkbench: rangeWindow latency distribution + decode/cache/seek cost
+// for one .raid file. Three phases:
+//   sweep  — `iters` windows strided across the whole chart (playback-like)
+//   random — `iters` uniform-random windows (sparse access / seeking)
+//   seek   — `seekIters` random chunkAtOrBefore + rangeWindow pairs
+// Reports P50/P95/P99 per phase, cache counters, decode throughput, peak
+// RSS, LRU occupancy and chunk-index memory.
+//   raid_engine chunkbench <file.raid> [windowMs] [iters] [seekIters]
+static int chunkbench(const std::string& path, double windowMs, int iters,
+                      int seekIters) {
+    raid::Reader rd;
+    std::string err;
+    if (!rd.open(path, err)) { std::printf("open failed: %s\n", err.c_str()); return 1; }
+    const raid::Info& info = rd.info();
+    const int64_t dur = rd.durationUs();
+    if (dur <= 0) { std::printf("empty chart\n"); return 1; }
+    if (windowMs <= 0) windowMs = 100.0;
+    if (iters <= 0) iters = 2000;
+    if (seekIters <= 0) seekIters = 500;
+    const int64_t wUs = int64_t(windowMs * 1000.0);
+
+    std::vector<raid::Event> evs;
+    std::vector<uint64_t> idx;
+    auto pct = [](std::vector<double>& v, double p) {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        const size_t k = std::min(v.size() - 1,
+            size_t(p * (v.size() - 1) + 0.5));
+        return v[k];
+    };
+    struct Phase {
+        std::vector<double> us;
+        uint64_t hits0, misses0, decodes0, bytes0;
+        double secs = 0;
+        uint64_t events = 0;
+    };
+    auto runPhase = [&](auto&& body) {
+        Phase ph;
+        rd.cacheStats(ph.hits0, ph.misses0, ph.decodes0, ph.bytes0);
+        const auto t0 = std::chrono::steady_clock::now();
+        body(ph);
+        ph.secs = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        return ph;
+    };
+    auto report = [&](const char* name, Phase& ph) {
+        uint64_t h, m, d, b;
+        rd.cacheStats(h, m, d, b);
+        const uint64_t dh = h - ph.hits0, dm = m - ph.misses0,
+                       dd = d - ph.decodes0, db = b - ph.bytes0;
+        std::printf("%-6s n=%zu  p50=%.3fms p95=%.3fms p99=%.3fms avg=%.3fms"
+                    "  ev=%llu  cache{hits=%llu miss=%llu dec=%llu MB=%.1f}"
+                    "  decode=%.1fMB/s\n",
+                    name, ph.us.size(), pct(ph.us, 0.50) / 1000.0,
+                    pct(ph.us, 0.95) / 1000.0, pct(ph.us, 0.99) / 1000.0,
+                    ph.us.empty() ? 0.0 :
+                        [&]{ double s=0; for(double x:ph.us)s+=x; return s/ph.us.size(); }()/1000.0,
+                    (unsigned long long)ph.events,
+                    (unsigned long long)dh, (unsigned long long)dm,
+                    (unsigned long long)dd, db / 1048576.0,
+                    ph.secs > 0 ? db / 1048576.0 / ph.secs : 0.0);
+    };
+
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&] { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+
+    // Sweep: evenly strided windows covering the chart.
+    Phase sweep = runPhase([&](Phase& ph) {
+        const int64_t step = std::max<int64_t>(wUs, dur / iters);
+        for (int64_t t = 0; t + wUs <= dur && int(ph.us.size()) < iters;
+             t += step) {
+            evs.clear(); idx.clear();
+            const auto q0 = std::chrono::steady_clock::now();
+            if (!rd.rangeWindow(t, std::min(t + wUs, dur), evs, idx, err)) {
+                std::printf("rangeWindow failed: %s\n", err.c_str());
+                std::exit(1);
+            }
+            ph.us.push_back(double(std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - q0).count()));
+            ph.events += evs.size();
+        }
+    });
+    report("sweep", sweep);
+
+    // Random sparse windows.
+    Phase rndPh = runPhase([&](Phase& ph) {
+        for (int i = 0; i < iters; ++i) {
+            const int64_t t = int64_t(rnd() % uint64_t(dur - wUs + 1));
+            evs.clear(); idx.clear();
+            const auto q0 = std::chrono::steady_clock::now();
+            if (!rd.rangeWindow(t, t + wUs, evs, idx, err)) {
+                std::printf("rangeWindow failed: %s\n", err.c_str());
+                std::exit(1);
+            }
+            ph.us.push_back(double(std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - q0).count()));
+            ph.events += evs.size();
+        }
+    });
+    report("random", rndPh);
+
+    // Seek: chunkAtOrBefore + window decode at random positions.
+    Phase seek = runPhase([&](Phase& ph) {
+        for (int i = 0; i < seekIters; ++i) {
+            const int64_t t = int64_t(rnd() % uint64_t(dur - wUs + 1));
+            evs.clear(); idx.clear();
+            const auto q0 = std::chrono::steady_clock::now();
+            (void)rd.chunkAtOrBefore(t);
+            if (!rd.rangeWindow(t, t + wUs, evs, idx, err)) {
+                std::printf("rangeWindow failed: %s\n", err.c_str());
+                std::exit(1);
+            }
+            ph.us.push_back(double(std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - q0).count()));
+            ph.events += evs.size();
+        }
+    });
+    report("seek  ", seek);
+
+    uint64_t h, m, d, b;
+    rd.cacheStats(h, m, d, b);
+    std::printf("file: %s  %.2f MB  chunks=%llu  patterns=%llu"
+                "  logicalEvents=%llu\n",
+                path.c_str(),
+                double(std::filesystem::file_size(path)) / 1048576.0,
+                (unsigned long long)info.chunkCount,
+                (unsigned long long)info.patternCount,
+                (unsigned long long)info.logicalEvents);
+    std::printf("index: %llu chunks x 56B = %.1f MB resident after open\n",
+                (unsigned long long)info.chunkCount,
+                info.chunkCount * 56.0 / 1048576.0);
+    std::printf("lru: cached=%llu cap=%llu (%.1f%%)  total decodes=%llu"
+                " misses=%llu  decoded=%.1f MB\n",
+                (unsigned long long)rd.cachedEvents(),
+                (unsigned long long)rd.cachedEventCapacity(),
+                100.0 * rd.cachedEvents() /
+                    std::max<uint64_t>(1, rd.cachedEventCapacity()),
+                (unsigned long long)d, (unsigned long long)m, b / 1048576.0);
+    std::printf("ram: peakRss=%.1f MB  curRss=%.1f MB\n",
+                peakRssBytes() / 1048576.0, curRssBytes() / 1048576.0);
     rd.close();
     return 0;
 }
@@ -1812,7 +2017,9 @@ int main(int argc, char** argv) {
                     "  raid_engine bench <file.raid> [jobs]\n"
                     "  raid_engine slicebench <file.raid>\n"
                     "  raid_engine eval <file.raid> <startMs> <endMs> [iters] [verify]\n"
+                    "  raid_engine chunkbench <file.raid> [windowMs] [iters] [seekIters]\n"
                     "  raid_engine repgen <out.raid> <repeats> <motif> <periodMs> [chunkEv] [stack] [keys]\n"
+                    "  raid_engine litgen <out.raid> <events> <durationMs> <chunkEvents> [keys]\n"
                     "  raid_engine stressgen <out.raid> <repeats> <motif> <periodMs> [stack] [keys]\n"
                     "  raid_engine densgen <out.raid> <sec> <evPerSec> <chunkEvents> [susEvery] [overlapEvery] [keys]\n"
                     "  raid_engine densbench <file.raid>\n"
@@ -1854,8 +2061,13 @@ int main(int argc, char** argv) {
         return evalCmd(argv[2], argv[3], argv[4],
                        argc > 5 ? std::atoi(argv[5]) : 1,
                        argc > 6 && std::string(argv[6]) == "verify");
+    if (cmd == "chunkbench" && argc >= 3)
+        return chunkbench(argv[2], argc > 3 ? std::atof(argv[3]) : 100.0,
+                          argc > 4 ? std::atoi(argv[4]) : 2000,
+                          argc > 5 ? std::atoi(argv[5]) : 500);
     if (cmd == "densgen" && argc >= 6) return densgen(argc, argv);
     if (cmd == "repgen" && argc >= 6) return repgen(argc, argv);
+    if (cmd == "litgen" && argc >= 6) return litgen(argc, argv);
     if (cmd == "stressgen" && argc >= 6) return stressgen(argc, argv);
     if (cmd == "densbench" && argc >= 3)
         return densbench(argv[2], argc >= 4 && std::string(argv[3]) == "rt",
