@@ -269,7 +269,12 @@ void ChartStream::close() {
 bool ChartStream::pump(int64_t startUs, int64_t endUs, std::vector<Event>& out,
                        std::vector<uint64_t>& indices, std::string& err) {
     harvestPrefetch();
-    return reader_.range(startUs, endUs, out, err, &indices);
+    // Window-sliced decode: identical events/indices to range(), but a
+    // cache miss expands only the requested window — with lazy pattern
+    // evaluation a huge repeat instance costs O(repeats-in-window), not
+    // O(repeats). rangeWindow self-selects whole-chunk decode+cache when
+    // the window covers most of a chunk's span.
+    return reader_.rangeWindow(startUs, endUs, out, indices, err);
 }
 
 void ChartStream::prefetch(int64_t startUs, int64_t endUs) {

@@ -2876,6 +2876,10 @@ struct Reader::Impl {
     // used to double every prefetched chunk's memory.
     bool warmChunk(size_t i, std::string& err) {
         if (i >= chunks_.size()) { err = "chunk index out of range"; return false; }
+        // A chunk whose expansion can never fit the LRU would evict every
+        // other resident chunk and still not be cacheable in practice —
+        // skip the wasted decode; rangeWindow slices it on demand instead.
+        if (chunks_[i].expanded > cacheCapEvents_) return true;
         {
             std::lock_guard<std::mutex> lk(cacheMutex_);
             if (Cached* hit = cacheFind(i)) {
