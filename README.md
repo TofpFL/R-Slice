@@ -1,3 +1,11 @@
+<div align='center'><img src="docs/readme_images/FNF_logo.png" width="800">
+
+<h2>Friday Night Funkin' is a rhythm game. Built using HaxeFlixel for <a href="https://ldjam.com/events/ludum-dare/47">Ludum Dare 47.</a></h2>
+
+This game was made with love to Newgrounds and its community. Extra love to Tom Fulp.
+
+</div>
+
 # R-Slice (AKA: RAID Engine)
 
 **R-Slice is a Friday Night Funkin' engine** — a full rhythm-game host with
