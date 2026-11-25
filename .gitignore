@@ -44,3 +44,10 @@ package-lock.json
 # Local archives / scratch - not part of the source tree
 /OLD RAID ENGINE.zip
 /Extract Raid Toolings/
+
+# Local build artifacts / scratch from the lime build
+/bin/
+/logs/
+/fw-tests/
+/HRKNotes/
+/*.log
