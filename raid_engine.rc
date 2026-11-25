@@ -1,4 +1,0 @@
-// Application icon for raid_engine.exe (Windows resource script).
-#include <windows.h>
-
-IDI_ICON1 ICON "RAID_File_Icon.ico"

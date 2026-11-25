@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xml>
+  <pragma once="true" />
+
+  <files id="haxe">
+    <compilerflag value="-I${this_dir}/include" />
+  </files>
+
+  <files id="raid-bridge">
+    <compilerflag value="-I${this_dir}/include" />
+    <compilerflag value="-IC:/Users/YalishannaZhou/Downloads/R-Slice-Main/src" />
+    <compilerflag value="/std:c++20" />
+    <file name="${this_dir}/src/raid_bridge.cpp" />
+    <file name="${this_dir}/src/raid_gl_smoke.cpp" />
+  </files>
+
+  <target id="haxe">
+    <section unless="mingw">
+        <lib name="C:/Users/YalishannaZhou/Downloads/R-Slice-Main/build/Release/gh_core.lib" />
+        <lib name="C:/Users/YalishannaZhou/Downloads/R-Slice-Main/build/Release/gh_lua.lib" />
+        <lib name="C:/Users/YalishannaZhou/Downloads/R-Slice-Main/build/Release/gh_miniz.lib" />
+    </section>
+
+    <files id="raid-bridge" />
+  </target>
+</xml>

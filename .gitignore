@@ -1,12 +1,46 @@
-build/
-dist/
-*.zip
-settings.cfg
-scores.cfg
-shot_*.png
-.vscode/
-.idea/
-.DS_Store
-third_party/
+.DS_STORE
+.haxelib/
+.vs/
+APIStuff.hx
+dump/
+temp/
+docs/temp/
+export/
+astc-textures/
+RECOVER_*.fla
+shitAudio/
+.build_time
+.swp
+NewgroundsCredentials.hx
 
-build_game/
+# Exclude IntelliJ IDEA stuff
+.idea/
+*.iml
+
+# Dox output and types
+docs/dox/output
+docs/dox/Windows.xml
+docs/dox/Mac.xml
+docs/dox/iOS.xml
+docs/dox/Linux.xml
+docs/dox/Android.xml
+
+# Mobile signing stuff
+.apple/
+.env
+*.keystore
+
+# Exclude JS stuff
+node_modules/
+package.json
+package-lock.json
+.aider*
+
+# R-Slice: game assets ship separately (proprietary V-Slice asset set);
+# do not commit the multi-GB assets/ or art/ trees.
+/assets/
+/art/
+
+# Local archives / scratch - not part of the source tree
+/OLD RAID ENGINE.zip
+/Extract Raid Toolings/
