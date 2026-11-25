@@ -110,8 +110,11 @@ folder and it is picked up automatically — no conversion step needed at
 play time.
 
 > **Note:** this repository ships **without `assets/` and `art/`** (the
-> multi-GB V-Slice asset set is excluded — see `.gitignore`). You must
-> supply the assets separately for the game to run.
+> multi-GB V-Slice asset set is excluded from git — see `.gitignore`).
+> Download the asset pack from the repo's **Releases** page
+> (`assets-vslice.zip`), then extract it into the repository root so the
+> `assets/` and `art/` folders sit next to `project.hxp` — see
+> [Installing the assets](#installing-the-assets) below.
 
 ### Folder layout that works
 
@@ -311,8 +314,8 @@ libs, then the game.
   `haxelib --global git haxelib https://github.com/FunkinCrew/haxelib.git`
   and `haxelib --global git hmm https://github.com/FunkinCrew/hmm.git`
 - `haxelib run lime setup` after installing lime
-- `assets/` and `art/` are **not in this repo** — supply the V-Slice
-  asset set separately or the game has nothing to play.
+- `assets/` and `art/` are **not in this repo** — install the asset pack
+  (below) or the game has nothing to play.
 
 ### Step 1 — build the engine libraries
 
@@ -354,6 +357,36 @@ build. See `docs/COMPILING.md` for the full flag list.
 That's it — `R-Slice.exe` is the official RAID-enabled build. Songs with
 `.raid` charts stream through the engine; everything else plays through
 the normal JSON path.
+
+### Installing the assets
+
+The game needs the V-Slice asset set (songs, sprites, characters, videos,
+fonts) which is **not stored in git** — it's distributed as a single zip on
+the repo's [Releases](../../releases) page:
+
+1. Download **`assets-vslice.zip`** from the latest release.
+2. Extract it **into the repository root** — the zip contains `assets/`
+   and `art/` at its top level, so after extraction you should have:
+
+   ```text
+   R-Slice-Main/
+     project.hxp
+     assets/          <- songs, sprites, videos, fonts
+     art/             <- app icons
+     source/
+     ...
+   ```
+
+   On Windows: right-click the zip → *Extract All* → choose the repo
+   folder. On macOS/Linux: `unzip assets-vslice.zip -d <repo-root>`.
+   If your extractor nests everything inside an `assets-vslice/` folder,
+   move the `assets/` and `art/` folders up one level.
+3. Rebuild (or just run `lime test windows`) — `project.hxp` picks up
+   `assets/` automatically.
+
+That's the full V-Slice content set: base FNF weeks, the V-Slice campaign
+weeks, character/stage sprites, fonts, and videos — everything Freeplay,
+Story Mode, and the editors need.
 
 ### Android APK — `tools/Androidify`
 
