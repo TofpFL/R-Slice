@@ -1,6 +1,6 @@
 package funkin.external.raid;
 
-#if (windows && cpp)
+#if (cpp && (windows || android))
 import funkin.data.song.SongData.SongChartData;
 import funkin.data.song.SongData.SongCharacterData;
 import funkin.data.song.SongData.SongMetadata;

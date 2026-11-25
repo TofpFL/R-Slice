@@ -2,25 +2,121 @@
 <xml>
   <pragma once="true" />
 
+  <!--
+    RAID engine integration for the lime/hxcpp build.
+
+    Engine sources live in <repo>/engine (CMake project). Prebuilt static
+    libs are expected at:
+      Windows (MSVC x64):  engine/build-msvc/Release/gh_*.lib
+      Android (per ABI):   engine/build-android/<abi>/libgh_*.a
+    where <abi> is arm64-v8a | armeabi-v7a | x86 | x86_64.
+
+    Build them with tools/build_engine.* (or cmake directly). Override the
+    whole tree with the RAID_ENGINE_ROOT environment variable (or a
+    -D haxedefine) if your engine checkout lives elsewhere — it must then
+    contain src/ plus the same build-* output layout.
+
+    Platforms without engine libs (macOS, Linux, iOS, HTML5) compile the
+    RAID Haxe bindings out entirely — .raid charts are unsupported there.
+  -->
+
   <files id="haxe">
     <compilerflag value="-I${this_dir}/include" />
+    <section if="RAID_ENGINE_ROOT">
+      <compilerflag value="-I${RAID_ENGINE_ROOT}/src" />
+    </section>
+    <section unless="RAID_ENGINE_ROOT">
+      <compilerflag value="-I${this_dir}/../../../../../engine/src" />
+    </section>
   </files>
 
   <files id="raid-bridge">
     <compilerflag value="-I${this_dir}/include" />
-    <compilerflag value="-IC:/Users/YalishannaZhou/Downloads/R-Slice-Main/src" />
+    <section if="RAID_ENGINE_ROOT">
+      <compilerflag value="-I${RAID_ENGINE_ROOT}/src" />
+    </section>
+    <section unless="RAID_ENGINE_ROOT">
+      <compilerflag value="-I${this_dir}/../../../../../engine/src" />
+    </section>
     <compilerflag value="/std:c++20" />
     <file name="${this_dir}/src/raid_bridge.cpp" />
-    <file name="${this_dir}/src/raid_gl_smoke.cpp" />
+    <!-- raid_gl_smoke.cpp is Win32-only (wglGetProcAddress/opengl32.dll);
+         the Haxe side is gated the same way, so other platforms skip it. -->
+    <section if="windows">
+      <file name="${this_dir}/src/raid_gl_smoke.cpp" />
+    </section>
   </files>
 
   <target id="haxe">
-    <section unless="mingw">
-        <lib name="C:/Users/YalishannaZhou/Downloads/R-Slice-Main/build/Release/gh_core.lib" />
-        <lib name="C:/Users/YalishannaZhou/Downloads/R-Slice-Main/build/Release/gh_lua.lib" />
-        <lib name="C:/Users/YalishannaZhou/Downloads/R-Slice-Main/build/Release/gh_miniz.lib" />
+    <!-- raid_bridge.cpp calls into gh_core; only link where libs exist. -->
+    <section if="windows" unless="mingw">
+      <section if="RAID_ENGINE_ROOT">
+        <lib name="${RAID_ENGINE_ROOT}/build-msvc/Release/gh_core.lib" />
+        <lib name="${RAID_ENGINE_ROOT}/build-msvc/Release/gh_lua.lib" />
+        <lib name="${RAID_ENGINE_ROOT}/build-msvc/Release/gh_miniz.lib" />
+      </section>
+      <section unless="RAID_ENGINE_ROOT">
+        <lib name="${this_dir}/../../../../../engine/build-msvc/Release/gh_core.lib" />
+        <lib name="${this_dir}/../../../../../engine/build-msvc/Release/gh_lua.lib" />
+        <lib name="${this_dir}/../../../../../engine/build-msvc/Release/gh_miniz.lib" />
+      </section>
+      <files id="raid-bridge" />
     </section>
 
-    <files id="raid-bridge" />
+    <!-- Android: lime invokes hxcpp once per ABI with -DHXCPP_<ABI>. -->
+    <section if="android">
+      <section if="HXCPP_ARM64">
+        <section if="RAID_ENGINE_ROOT">
+          <lib name="${RAID_ENGINE_ROOT}/build-android/arm64-v8a/libgh_core.a" />
+          <lib name="${RAID_ENGINE_ROOT}/build-android/arm64-v8a/libgh_lua.a" />
+          <lib name="${RAID_ENGINE_ROOT}/build-android/arm64-v8a/libgh_miniz.a" />
+        </section>
+        <section unless="RAID_ENGINE_ROOT">
+          <lib name="${this_dir}/../../../../../engine/build-android/arm64-v8a/libgh_core.a" />
+          <lib name="${this_dir}/../../../../../engine/build-android/arm64-v8a/libgh_lua.a" />
+          <lib name="${this_dir}/../../../../../engine/build-android/arm64-v8a/libgh_miniz.a" />
+        </section>
+      </section>
+      <section if="HXCPP_ARMV7">
+        <section if="RAID_ENGINE_ROOT">
+          <lib name="${RAID_ENGINE_ROOT}/build-android/armeabi-v7a/libgh_core.a" />
+          <lib name="${RAID_ENGINE_ROOT}/build-android/armeabi-v7a/libgh_lua.a" />
+          <lib name="${RAID_ENGINE_ROOT}/build-android/armeabi-v7a/libgh_miniz.a" />
+        </section>
+        <section unless="RAID_ENGINE_ROOT">
+          <lib name="${this_dir}/../../../../../engine/build-android/armeabi-v7a/libgh_core.a" />
+          <lib name="${this_dir}/../../../../../engine/build-android/armeabi-v7a/libgh_lua.a" />
+          <lib name="${this_dir}/../../../../../engine/build-android/armeabi-v7a/libgh_miniz.a" />
+        </section>
+      </section>
+      <section if="HXCPP_X86_64">
+        <section if="RAID_ENGINE_ROOT">
+          <lib name="${RAID_ENGINE_ROOT}/build-android/x86_64/libgh_core.a" />
+          <lib name="${RAID_ENGINE_ROOT}/build-android/x86_64/libgh_lua.a" />
+          <lib name="${RAID_ENGINE_ROOT}/build-android/x86_64/libgh_miniz.a" />
+        </section>
+        <section unless="RAID_ENGINE_ROOT">
+          <lib name="${this_dir}/../../../../../engine/build-android/x86_64/libgh_core.a" />
+          <lib name="${this_dir}/../../../../../engine/build-android/x86_64/libgh_lua.a" />
+          <lib name="${this_dir}/../../../../../engine/build-android/x86_64/libgh_miniz.a" />
+        </section>
+      </section>
+      <section if="HXCPP_X86">
+        <section if="RAID_ENGINE_ROOT">
+          <lib name="${RAID_ENGINE_ROOT}/build-android/x86/libgh_core.a" />
+          <lib name="${RAID_ENGINE_ROOT}/build-android/x86/libgh_lua.a" />
+          <lib name="${RAID_ENGINE_ROOT}/build-android/x86/libgh_miniz.a" />
+        </section>
+        <section unless="RAID_ENGINE_ROOT">
+          <lib name="${this_dir}/../../../../../engine/build-android/x86/libgh_core.a" />
+          <lib name="${this_dir}/../../../../../engine/build-android/x86/libgh_lua.a" />
+          <lib name="${this_dir}/../../../../../engine/build-android/x86/libgh_miniz.a" />
+        </section>
+      </section>
+      <files id="raid-bridge" />
+    </section>
+
+    <!-- Any other platform: RAID bindings are compiled out (see the #if
+         gates in funkin.external.raid.* and PlayState). -->
   </target>
 </xml>

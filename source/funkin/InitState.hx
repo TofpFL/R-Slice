@@ -474,7 +474,7 @@ class InitState extends FlxState
     }
     else if (params.song.shouldLoadSong && params.song.songPath != null)
     {
-      #if (windows && cpp)
+      #if (cpp && (windows || android))
       var cliSongPath:String = params.song.songPath;
       if (cliSongPath.toLowerCase().endsWith('.raid'))
       {

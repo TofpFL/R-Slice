@@ -52,3 +52,10 @@ package-lock.json
 /HRKNotes/
 /*.log
 /assets-vslice.zip
+
+# Engine build output (rebuilt locally via CMake)
+/engine/build*/
+/engine/_deps/
+
+# JDK auto-installed by tools/Androidify.* --install
+/tools/jdk-*/

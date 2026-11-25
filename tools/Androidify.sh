@@ -117,15 +117,33 @@ install_jdk() {
     aarch64|arm64) arch=aarch64 ;;
     *) arch=x64 ;;
   esac
-  url="https://api.adoptium.net/v3/binary/latest/17/ga/$os/$arch/jdk/hotspot/normal/archive"
+  # The /v3/binary/latest endpoint 404s; query the assets API for the
+  # actual archive link (returns .zip on Windows, .tar.gz elsewhere).
+  local meta; meta="$(mktemp)"
+  curl -fsSL --retry 3 -o "$meta" \
+    "https://api.adoptium.net/v3/assets/latest/17/hotspot?architecture=$arch&image_type=jdk&os=$os&vendor=eclipse&heap_size=normal&jvm_impl=hotspot" || {
+    echo "  [FAIL] JDK metadata fetch failed - get it manually:"
+    echo "         https://adoptium.net/temurin/releases/?version=17"
+    rm -f "$meta"; return
+  }
+  url="$(grep -oE '"link": *"[^"]*\.(zip|tar\.gz)"' "$meta" | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
+  rm -f "$meta"
+  if [ -z "$url" ]; then
+    echo "  [FAIL] no JDK archive link in Adoptium response"
+    return
+  fi
   local tmp; tmp="$(mktemp -d)"
-  if ! curl -fL --retry 3 -o "$tmp/jdk.tar.gz" "$url" 2>/dev/null; then
+  if ! curl -fL --retry 3 -o "$tmp/jdk.archive" "$url" 2>/dev/null; then
     echo "  [FAIL] JDK download failed - get it manually:"
     echo "         https://adoptium.net/temurin/releases/?version=17"
     rm -rf "$tmp"; return
   fi
   mkdir -p "$ROOT/tools"
-  tar -xzf "$tmp/jdk.tar.gz" -C "$ROOT/tools" 2>/dev/null
+  case "$url" in
+    *.zip) unzip -q -o "$tmp/jdk.archive" -d "$ROOT/tools" 2>/dev/null || {
+      echo "  [FAIL] JDK extract failed (unzip missing?)"; rm -rf "$tmp"; return; } ;;
+    *) tar -xzf "$tmp/jdk.archive" -C "$ROOT/tools" 2>/dev/null ;;
+  esac
   rm -rf "$tmp"
   for d in "$ROOT"/tools/jdk-17*; do
     [ -x "$d/bin/javac" ] || [ -x "$d/Contents/Home/bin/javac" ] && JDK_ROOT="$d"
@@ -216,7 +234,7 @@ install_sdk_packages() {
   export JAVA_HOME="${JDK_ROOT:-${JAVA_HOME:-}}"
   [ -n "$JDK_ROOT" ] && export PATH="$JDK_ROOT/bin:$PATH"
   echo "  [ .. ] installing SDK packages (platforms, build-tools, NDK 29.0.13113456)..."
-  "$SDKM" --sdk_root="$ANDROID_HOME" --install \
+  "$SDKM" --sdk_root="$ANDROID_HOME" \
     "platforms;android-29" "platforms;android-35" \
     "build-tools;35.0.0" "ndk;29.0.13113456"
 }
@@ -299,6 +317,12 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   echo "============================================================"
   exit 0
 fi
+
+echo "  Building RAID engine native libs for Android..."
+"$ROOT/tools/build_engine.sh" android arm64-v8a armeabi-v7a x86_64 x86 || {
+  echo "[FAIL] engine build failed - cannot produce a RAID-enabled APK."
+  exit 1
+}
 
 echo "  Running: haxelib run lime build android"
 export JAVA_HOME="${JDK_ROOT:-${JAVA_HOME:-}}"

@@ -50,12 +50,14 @@ import funkin.play.notes.notekind.NoteKind;
 import funkin.play.notes.NoteSprite;
 import funkin.play.notes.notestyle.NoteStyle;
 import funkin.play.notes.Strumline;
-#if (windows && cpp)
+#if (cpp && (windows || android))
 import funkin.external.raid.RaidChartStream;
 import funkin.external.raid.RaidProf;
 import funkin.external.raid.RaidGLNotes;
-import funkin.external.raid.RaidGLSmokeCtl;
 import funkin.external.raid.RaidNoteJudge;
+#end
+#if (windows && cpp)
+import funkin.external.raid.RaidGLSmokeCtl;
 #end
 import funkin.play.notes.SustainTrail;
 import funkin.play.notes.NoteVibrationsHandler;
@@ -613,7 +615,7 @@ class PlayState extends MusicBeatSubState
    * The sprite group containing active player's strumline notes.
    */
   public var playerStrumline:Strumline;
-#if (windows && cpp)
+#if (cpp && (windows || android))
   /**
    * Streaming chart feed for `.raid` difficulties (SongDifficulty.raidChartPath).
    * Null for normal JSON charts.
@@ -1097,7 +1099,7 @@ class PlayState extends MusicBeatSubState
   {
     if (criticalFailure) return;
 
-#if (windows && cpp)
+#if (cpp && (windows || android))
     // Feed streaming-chart notes before the strumlines scan their
     // noteData this frame.
     if (raidStream != null)
@@ -2736,7 +2738,7 @@ class PlayState extends MusicBeatSubState
     playerStrumline.applyNoteData(playerNoteData);
     opponentStrumline.applyNoteData(opponentNoteData);
 
-#if (windows && cpp)
+#if (cpp && (windows || android))
     // RAID/streaming charts carry no materialized notes; open (or reuse)
     // the engine and rewind it to the start timestamp. pumpRaidNotes()
     // feeds the strumlines incrementally from here on.
@@ -4171,7 +4173,7 @@ class PlayState extends MusicBeatSubState
      */
   function performCleanup():Void
   {
-#if (windows && cpp)
+#if (cpp && (windows || android))
     raidStream?.close();
     raidStream = null;
 #end
@@ -4591,7 +4593,7 @@ class PlayState extends MusicBeatSubState
 
     Conductor.instance.update(FlxG.sound?.music?.time ?? 0.0);
 
-#if (windows && cpp)
+#if (cpp && (windows || android))
     // RAID charts: the stream's feed position must follow the skip, and
     // the rolling noteData window must be dropped — the pump re-feeds
     // from the seek point, so stale entries would duplicate or arrive

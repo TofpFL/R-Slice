@@ -171,6 +171,13 @@ if %CHECK_ONLY%==1 (
   popd
   exit /b 0
 )
+echo   Building RAID engine native libs for Android...
+call "%ROOT%\tools\build_engine.bat" android arm64-v8a armeabi-v7a x86_64 x86
+if errorlevel 1 (
+  echo [FAIL] engine build failed - cannot produce a RAID-enabled APK.
+  popd
+  exit /b 1
+)
 echo   Running: haxelib run lime build android
 if defined JDK_ROOT set "JAVA_HOME=!JDK_ROOT!" && set "PATH=!JDK_ROOT!\bin;!PATH!"
 call haxelib run lime build android
@@ -213,11 +220,11 @@ exit /b 0
 
 :install_jdk
 rem Download Temurin JDK 17 (zip, no admin needed) into tools\jdk-17*
-echo   [ .. ] installing JDK 17 via Adoptium archive...
+echo   [ .. ] installing JDK 17 via Adoptium...
 set "JDK_ZIP=%TEMP%\androidify-jdk17.zip"
 set "JDK_DST=%ROOT%\tools"
-set "JDK_URL=https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/archive"
-curl -L --retry 3 -o "%JDK_ZIP%" "%JDK_URL%" >nul 2>&1
+set "JDK_URL=https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.21.1%%2B2/OpenJDK17U-jdk_x64_windows_hotspot_17.0.21.1_2.zip"
+curl -L --retry 3 -f -o "%JDK_ZIP%" "%JDK_URL%"
 if errorlevel 1 (
   echo   [FAIL] JDK download failed - get it manually:
   echo          https://adoptium.net/temurin/releases/?version=17
@@ -256,15 +263,12 @@ exit /b 0
 rem Download Android cmdline-tools and unpack into %ANDROID_HOME%\cmdline-tools\latest
 echo   [ .. ] installing Android command-line tools...
 set "SDK_ZIP=%TEMP%\androidify-cmdtools.zip"
-set "OK=0"
-for %%u in (
-  "https://dl.google.com/android/repository/commandlinetools-win-13114758_latest.zip"
-  "https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip"
-) do (
-  if not defined OK (
-    curl -L --retry 3 -o "%SDK_ZIP%" "%%u" >nul 2>&1
-    if not errorlevel 1 set "OK=1"
-  )
+set "OK="
+curl -L --retry 3 -f -o "%SDK_ZIP%" "https://dl.google.com/android/repository/commandlinetools-win-13114758_latest.zip" >nul 2>&1
+if not errorlevel 1 set "OK=1"
+if not defined OK (
+  curl -L --retry 3 -f -o "%SDK_ZIP%" "https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip" >nul 2>&1
+  if not errorlevel 1 set "OK=1"
 )
 if not defined OK (
   echo   [FAIL] cmdline-tools download failed - install Android Studio
@@ -306,5 +310,5 @@ if defined JDK_ROOT (
   set "JAVA_HOME=!JDK_ROOT!"
   set "PATH=!JDK_ROOT!\bin;!PATH!"
 )
-"%SDKM%" --sdk_root="%ANDROID_HOME%" --install "platforms;android-29" "platforms;android-35" "build-tools;35.0.0" "ndk;29.0.13113456"
+"%SDKM%" --sdk_root="%ANDROID_HOME%" "platforms;android-29" "platforms;android-35" "build-tools;35.0.0" "ndk;29.0.13113456"
 exit /b 0

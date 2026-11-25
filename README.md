@@ -182,9 +182,9 @@ the game is not finished — treat it as experimental and expect changes.
 
 ## `raid_engine` — the CLI
 
-`raid_engine.exe` is the source of truth for all format work. (The CLI
-source lives in the pre-switch codebase — recoverable from git history —
-and prebuilt binaries ship in the tooling archive.)
+`raid_engine.exe` is the source of truth for all format work. It builds
+from `engine/` (`cmake --build engine/build --target raid_engine`, or
+`tools/build_engine.*`) — see `engine/README.md`.
 
 ### Converting charts
 
@@ -319,27 +319,30 @@ libs, then the game.
 
 ### Step 1 — build the engine libraries
 
-The engine C++ sources are being migrated into this repo; until then they
-are recoverable from git history (pre-`MAJOR UPDATE: CODEBASE SWITCH`).
-Build them with CMake:
+The engine source lives in **`engine/`** in this repo (see
+`engine/README.md`). Build the libraries the game links:
 
 ```sh
-cmake -S <engine-src> -B build-engine -DCMAKE_BUILD_TYPE=Release
-cmake --build build-engine --config Release --target gh_core
+tools/build_engine.bat              # Windows: MSVC libs + Android ABIs
+tools/build_engine.sh               # git-bash / Linux / macOS
+# or directly:
+cmake -S engine -B engine/build-msvc -G "Visual Studio 17 2022" -A x64
+cmake --build engine/build-msvc --config Release --target gh_core
 ```
 
-`gh_core` pulls in `gh_lua` and `gh_miniz` automatically, producing
-`gh_core.lib`, `gh_lua.lib`, `gh_miniz.lib`. Deps are fetched on first
-configure, so the first build needs internet (or a source package with
-`third_party/` vendored).
+This produces `engine/build-msvc/Release/gh_core.lib`, `gh_lua.lib`,
+`gh_miniz.lib` (plus `raid_engine` and `gh_tests` on desktop). First
+configure downloads pinned deps (Lua 5.4.7, miniz 3.0.2, raylib for
+`raidtool`) — needs internet unless you vendor `engine/third_party/`.
 
-### Step 2 — point the game at your engine
+### Step 2 — the game picks it up automatically
 
-`source/funkin/external/raid/project/Build.xml` contains the paths the
-shim compiles and links against — the `-I` include path for
-`engine_abi.h`/`raid.hpp` and the three `<lib>` entries for
-`gh_core.lib`/`gh_lua.lib`/`gh_miniz.lib`. Update them to wherever your
-engine build and headers live.
+`source/funkin/external/raid/project/Build.xml` resolves everything
+relative to the repo — **no manual edits needed on a fresh clone**. It
+expects the libs at `engine/build-msvc/Release/` (Windows) or
+`engine/build-android/<abi>/` (Android). If your engine checkout lives
+elsewhere, set the `RAID_ENGINE_ROOT` environment variable (or `-D`
+haxedefine) to its root instead.
 
 ### Step 3 — build the game
 
@@ -402,10 +405,11 @@ tools\Androidify.bat --check     # verify toolchain only
 tools\Androidify.bat --install   # fetch missing pieces, then build
 ```
 
-> **`.raid` on Android: not yet.** The engine bindings are
-> Windows-only (`#if windows && cpp`) — an APK plays normal JSON songs
-> but cannot stream `.raid` charts until the engine is built for Android
-> NDK and the bridge is ungated.
+> **`.raid` on Android:** supported — `Androidify` builds the engine's
+> per-ABI static libs (`engine/build-android/<abi>/`) before invoking
+> lime, and the Haxe bindings are enabled for `windows || android`.
+> The GL instrumentation path (`RaidGLSmoke`) remains Windows-only; note
+> batching falls back to the CPU path on Android.
 
 ---
 
@@ -473,11 +477,12 @@ trillions today":
   on-screen density the draw-call count, not memory, is the next wall.
 - **`.rchr` character packs are in development** — format and CLI exist,
   in-game mounting is unfinished.
-- **`.raid` is Windows-only for now** — the Haxe bindings are gated to
-  `windows && cpp`; Android/iOS play JSON charts only.
-- **Engine sources are mid-migration** — the C++ core lives in git history
-  until it's merged into `source/funkin/external/raid/project/`; the
-  prebuilt `.lib`s currently linked by `Build.xml` are local artifacts.
+- **`.raid` supports Windows and Android** — the Haxe bindings are gated
+  to `cpp && (windows || android)`; macOS/Linux/iOS play JSON charts
+  only until engine libs are wired for those targets.
+- **GL note batching is Windows-only** — `RaidGLNotes`' instanced-GL
+  backend (`RaidGLSmoke`) uses WGL and stays Windows-gated; other
+  platforms use the CPU draw path.
 - **The pattern log reports encoded ops**, not visual note patterns — it's
   a map of pattern→pattern changes, not what the player saw.
 

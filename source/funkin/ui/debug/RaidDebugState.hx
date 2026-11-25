@@ -1,5 +1,7 @@
 package funkin.ui.debug;
 
+#if (cpp && (windows || android))
+
 import flixel.FlxG;
 import flixel.FlxState;
 import flixel.text.FlxText;
@@ -38,7 +40,7 @@ class RaidDebugState extends FlxState
 
 		path = Sys.getEnv("RAID_CHART");
 		if (path == null || path.length == 0)
-			path = "C:/Users/YalishannaZhou/AppData/Local/Temp/dens/d10k.raid";
+			path = "raid_debug.raid";
 
 		engine = RaidEngine.open(path);
 		autoPlay = Sys.getEnv("RAID_PLAYSTATE") != null;
@@ -203,3 +205,5 @@ class RaidDebugState extends FlxState
 		super.destroy();
 	}
 }
+
+#end

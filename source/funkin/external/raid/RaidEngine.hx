@@ -1,6 +1,6 @@
 package funkin.external.raid;
 
-#if (windows && cpp)
+#if (cpp && (windows || android))
 /**
  * Haxe bindings for the R-Slice RAID playback engine C ABI
  * (R-Slice-Main/src/engine_abi.h), reached through the C++ shim in
