@@ -39,7 +39,11 @@ package-lock.json
 # R-Slice: game assets ship separately (proprietary V-Slice asset set);
 # do not commit the multi-GB assets/ or art/ trees.
 /assets/
-/art/
+/art/*
+# ...except the tiny Android adaptive-icon set needed to build APKs
+!/art/icons/
+/art/icons/*
+!/art/icons/android/
 
 # Local archives / scratch - not part of the source tree
 /OLD RAID ENGINE.zip
