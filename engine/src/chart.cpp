@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <filesystem>
 #include <limits>
 
@@ -27,9 +28,11 @@ bool readTextFile(const std::string& path, std::string& out) {
     const long long sz = _ftelli64(f);
     _fseeki64(f, 0, SEEK_SET);
 #else
-    std::fseek(f, 0, SEEK_END);
-    const long sz = std::ftello(f);
-    std::fseek(f, 0, SEEK_SET);
+    // fseeko/ftello are 64-bit on every POSIX target (Android off_t is
+    // always 64-bit); std::ftello doesn't exist in the Android libc++.
+    fseeko(f, 0, SEEK_END);
+    const std::int64_t sz = ftello(f);
+    fseeko(f, 0, SEEK_SET);
 #endif
     if (sz < 0) { std::fclose(f); return false; }
     out.resize(size_t(sz));

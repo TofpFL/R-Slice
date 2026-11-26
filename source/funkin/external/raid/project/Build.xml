@@ -38,7 +38,12 @@
     <section unless="RAID_ENGINE_ROOT">
       <compilerflag value="-I${this_dir}/../../../../../engine/src" />
     </section>
-    <compilerflag value="/std:c++20" />
+    <section if="windows">
+      <compilerflag value="/std:c++20" />
+    </section>
+    <section if="android">
+      <compilerflag value="-std=c++20" />
+    </section>
     <file name="${this_dir}/src/raid_bridge.cpp" />
     <!-- raid_gl_smoke.cpp is Win32-only (wglGetProcAddress/opengl32.dll);
          the Haxe side is gated the same way, so other platforms skip it. -->
