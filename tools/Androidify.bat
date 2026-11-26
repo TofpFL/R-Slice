@@ -92,7 +92,7 @@ set "SDKM="
 call :find_sdkmanager
 if not defined SDKM if %DO_INSTALL%==1 call :install_sdk_tools
 call :find_sdkmanager
-if defined SDKM call :install_sdk_packages
+if defined SDKM if %DO_INSTALL%==1 call :install_sdk_packages
 
 rem ---------- 3. JDK 17 ----------
 echo.
@@ -171,6 +171,59 @@ if %CHECK_ONLY%==1 (
   popd
   exit /b 0
 )
+rem ---------- lime Android ndll ----------
+rem hmm.json installs lime from git; git checkouts ship an empty ndll/ dir,
+rem so liblime-*.so must be copied in from a lib.haxe.org release zip.
+set "LIME_DIR="
+for /d %%d in ("%ROOT%\.haxelib\lime\*") do (
+  if exist "%%d\haxelib.json" if not defined LIME_DIR set "LIME_DIR=%%d"
+)
+if not defined LIME_DIR (
+  echo   [FAIL] lime haxelib not found - run hmm install first
+  set FAIL=1
+) else (
+  if exist "%LIME_DIR%\ndll\Android\liblime-64.so" (
+    echo   [ OK ] lime Android ndll present
+  ) else (
+    echo   [ .. ] lime git checkout lacks Android ndll - fetching release libs...
+    set "LIME_ZIP=%TEMP%\androidify-lime.zip"
+    set "LIME_VER="
+    for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "(Get-Content '%LIME_DIR%\haxelib.json' -Raw | ConvertFrom-Json).version"`) do set "LIME_VER=%%v"
+    curl -fsSL --retry 3 -o "%LIME_ZIP%" "https://lib.haxe.org/p/lime/!LIME_VER!/download/" >nul 2>&1
+    if errorlevel 1 (
+      rem version from haxelib.json may not exist as a release - resolve latest
+      for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "$r=(Invoke-WebRequest -UseBasicParsing 'https://lib.haxe.org/p/lime/').Content; [regex]::Matches($r,'/p/lime/(\d+\.\d+\.\d+)/download/') | ForEach-Object { $_.Groups[1].Value } | Sort-Object {[version]$_} | Select-Object -Last 1"`) do set "LIME_VER=%%v"
+      if defined LIME_VER curl -fsSL --retry 3 -o "%LIME_ZIP%" "https://lib.haxe.org/p/lime/!LIME_VER!/download/" >nul 2>&1
+    )
+    if not exist "%LIME_ZIP%" (
+      echo   [FAIL] could not download lime release - get ndll/Android manually
+      echo          from https://lib.haxe.org/p/lime/ and place the .so files in:
+      echo          %LIME_DIR%\ndll\Android\
+      set FAIL=1
+    ) else (
+      powershell -NoProfile -Command "Expand-Archive -Path '%LIME_ZIP%' -DestinationPath '%TEMP%\androidify-lime' -Force" >nul 2>&1
+      mkdir "%LIME_DIR%\ndll\Android" 2>nul
+      for /r "%TEMP%\androidify-lime" %%f in (liblime-*.so liblime-*.so.hash) do copy /y "%%f" "%LIME_DIR%\ndll\Android\" >nul
+      if exist "%LIME_DIR%\ndll\Android\liblime-64.so" (
+        echo   [ OK ] installed lime Android ndll
+      ) else (
+        echo   [FAIL] ndll/Android missing from downloaded lime package
+        set FAIL=1
+      )
+    )
+    del "%LIME_ZIP%" >nul 2>&1
+    rd /s /q "%TEMP%\androidify-lime" >nul 2>&1
+  )
+)
+
+if %FAIL%==1 (
+  echo.
+  echo ============================================================
+  echo  NOT BUILDING - fix the [FAIL] items above first.
+  echo ============================================================
+  popd
+  exit /b 1
+)
 echo   Building RAID engine native libs for Android...
 call "%ROOT%\tools\build_engine.bat" android arm64-v8a armeabi-v7a x86_64 x86
 if errorlevel 1 (
@@ -178,9 +231,11 @@ if errorlevel 1 (
   popd
   exit /b 1
 )
-echo   Running: haxelib run lime build android
+rem -DNO_FEATURE_VIDEO_PLAYBACK: hxvlc ships no Android VLC libs, so video
+rem playback (splash MP4, cutscenes) is disabled on Android for now.
+echo   Running: haxelib run lime build android -DNO_FEATURE_VIDEO_PLAYBACK
 if defined JDK_ROOT set "JAVA_HOME=!JDK_ROOT!" && set "PATH=!JDK_ROOT!\bin;!PATH!"
-call haxelib run lime build android
+call haxelib run lime build android -DNO_FEATURE_VIDEO_PLAYBACK
 set RC=%ERRORLEVEL%
 echo.
 if %RC%==0 (

@@ -298,6 +298,46 @@ if [ "$FAIL" -eq 0 ]; then
   fi
 fi
 
+# ---------- lime Android ndll ----------
+# hmm.json installs lime from git (FunkinCrew/lime); git checkouts ship an
+# empty ndll/ dir, so liblime-*.so must be copied in from a release zip.
+ensure_lime_ndll() {
+  local lime_dir=""
+  for d in "$ROOT"/.haxelib/lime/*/; do
+    [ -f "$d/haxelib.json" ] && lime_dir="${d%/}" && break
+  done
+  [ -z "$lime_dir" ] && { echo "  [FAIL] lime haxelib not found - run hmm install first"; return 1; }
+  if ls "$lime_dir"/ndll/Android/liblime-64.so >/dev/null 2>&1; then
+    echo "  [ OK ] lime Android ndll present"
+    return 0
+  fi
+  echo "  [ .. ] lime git checkout lacks Android ndll - fetching release libs..."
+  local ver
+  ver="$(grep -oE '"version"[^,}]*' "$lime_dir/haxelib.json" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  local tmp; tmp="$(mktemp -d)"
+  # The git checkout's version may not exist as a release; if the download
+  # fails (or no version was found), fall back to the latest release listed
+  # on the lib.haxe.org project page.
+  if [ -n "$ver" ] && curl -fsSL --retry 3 -o "$tmp/lime.zip" "https://lib.haxe.org/p/lime/$ver/download/" 2>/dev/null; then
+    : # got it
+  else
+    ver="$(curl -fsSL "https://lib.haxe.org/p/lime/" 2>/dev/null | grep -oE '/p/lime/[0-9]+\.[0-9]+\.[0-9]+/download/' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)"
+    [ -z "$ver" ] && { echo "  [FAIL] could not determine lime release version"; rm -rf "$tmp"; return 1; }
+    curl -fsSL --retry 3 -o "$tmp/lime.zip" "https://lib.haxe.org/p/lime/$ver/download/" 2>/dev/null || {
+      echo "  [FAIL] could not download lime $ver release"; rm -rf "$tmp"; return 1; }
+  fi
+  mkdir -p "$lime_dir/ndll/Android"
+  unzip -o -j "$tmp/lime.zip" "*/ndll/Android/*" -d "$lime_dir/ndll/Android" >/dev/null 2>&1 \
+    || unzip -o -j "$tmp/lime.zip" "ndll/Android/*" -d "$lime_dir/ndll/Android" >/dev/null 2>&1
+  rm -rf "$tmp"
+  if ls "$lime_dir"/ndll/Android/liblime-64.so >/dev/null 2>&1; then
+    echo "  [ OK ] installed lime Android ndll from release $ver"
+  else
+    echo "  [FAIL] ndll/Android missing from downloaded lime package"
+    return 1
+  fi
+}
+
 # ---------- 6. build ----------
 echo
 echo "[6/6] Build"
@@ -318,16 +358,20 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   exit 0
 fi
 
+ensure_lime_ndll || exit 1
+
 echo "  Building RAID engine native libs for Android..."
 "$ROOT/tools/build_engine.sh" android arm64-v8a armeabi-v7a x86_64 x86 || {
   echo "[FAIL] engine build failed - cannot produce a RAID-enabled APK."
   exit 1
 }
 
-echo "  Running: haxelib run lime build android"
+echo "  Running: haxelib run lime build android -DNO_FEATURE_VIDEO_PLAYBACK"
 export JAVA_HOME="${JDK_ROOT:-${JAVA_HOME:-}}"
 [ -n "$JDK_ROOT" ] && export PATH="$JDK_ROOT/bin:$PATH"
-haxelib run lime build android
+# -DNO_FEATURE_VIDEO_PLAYBACK: hxvlc ships no Android VLC libs, so video
+# playback (splash MP4, cutscenes) is disabled on Android for now.
+haxelib run lime build android -DNO_FEATURE_VIDEO_PLAYBACK
 RC=$?
 echo
 if [ "$RC" -eq 0 ]; then
