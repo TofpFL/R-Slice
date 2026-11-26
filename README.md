@@ -395,15 +395,22 @@ Story Mode, and the editors need.
 
 `tools/Androidify.bat` (Windows) and `tools/Androidify.sh`
 (git-bash/Linux/macOS) automate the Android build: they check Haxe,
-haxelibs, JDK 17, Android SDK/NDK, and lime config — and with `--install`
-they download the missing pieces (Temurin JDK 17 zip, Android
-cmdline-tools, `platforms;android-29/35`, `build-tools;35.0.0`,
-`ndk;29.0.13113456`). Then `lime build android` produces the APK.
+haxelibs, JDK 17, Android SDK/NDK, lime's Android `ndll` libs, and lime
+config — and with `--install` they download the missing pieces (Temurin
+JDK 17, Android cmdline-tools, `platforms;android-29/35`,
+`build-tools;35.0.0`, `ndk;29.0.13113456`, and the lime `ndll/Android`
+`.so` files that git checkouts don't ship). Point `ANDROID_HOME` at your
+SDK if it isn't the default location.
 
 ```text
 tools\Androidify.bat --check     # verify toolchain only
 tools\Androidify.bat --install   # fetch missing pieces, then build
 ```
+
+The APK lands at `export/release/android/bin/app/build/outputs/apk/debug/`.
+Debug APKs are large (~1 GB — uncompressed assets + both ABIs); video
+playback is compiled out on Android (`-DNO_FEATURE_VIDEO_PLAYBACK`) because
+hxvlc ships no Android VLC libraries.
 
 > **`.raid` on Android:** supported — `Androidify` builds the engine's
 > per-ABI static libs (`engine/build-android/<abi>/`) before invoking
