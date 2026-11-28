@@ -48,8 +48,8 @@ class RaidChartStream
 
 	public function new(path:String)
 	{
-		this.path = path;
-		engine = RaidEngine.open(path);
+		this.path = resolveEnginePath(path);
+		engine = RaidEngine.open(this.path);
 		if (engine == null) throw 'RaidChartStream: gh_engine_open failed for $path';
 		kind = RaidEngine.kind(engine);
 		logicalEvents = RaidEngine.logicalEvents(engine);
@@ -280,7 +280,7 @@ class RaidChartStream
 		var gf:String = 'gf';
 		var stage:String = 'mainStage';
 
-		var metaPtr = RaidEngine.metaJson(raidPath);
+		var metaPtr = RaidEngine.metaJson(resolveEnginePath(raidPath));
 		if (metaPtr != null)
 		{
 			try
@@ -321,6 +321,50 @@ class RaidChartStream
 		var diff = song.getDifficulty(Constants.DEFAULT_DIFFICULTY, Constants.DEFAULT_VARIATION);
 		if (diff != null) diff.raidChartPath = raidPath;
 		return song;
+	}
+
+	/**
+	 * On Android the chart lives inside the APK's assets — there is no
+	 * filesystem path the engine's fopen() can reach (Sys.programPath()
+	 * resolves to /system/bin, so gameDirectory-based paths are garbage).
+	 * Rebuild the openfl asset id from the `songs/<id>/<file>` tail,
+	 * copy the bytes into app storage once, and return the real path.
+	 * Desktop paths and genuine filesystem paths pass through unchanged.
+	 */
+	static var enginePathCache:Map<String, String> = new Map();
+	static function resolveEnginePath(path:String):String
+	{
+		#if android
+		var cached = enginePathCache.get(path);
+		if (cached != null) return cached;
+		if (!sys.FileSystem.exists(path))
+		{
+			var songsIdx:Int = path.indexOf('songs/');
+			if (songsIdx >= 0)
+			{
+				var assetId:String = 'songs:assets/' + path.substr(songsIdx);
+				try
+				{
+					var bytes:haxe.io.Bytes = openfl.utils.Assets.getBytes(assetId);
+					if (bytes != null)
+					{
+						var dir:String = lime.system.System.applicationStorageDirectory
+							+ '/raidcache';
+						sys.FileSystem.createDirectory(dir);
+						var real:String = dir + '/' + path.substr(path.lastIndexOf('/') + 1);
+						sys.io.File.saveBytes(real, bytes);
+						enginePathCache.set(path, real);
+						return real;
+					}
+				}
+				catch (_) {}
+			}
+		}
+		enginePathCache.set(path, path);
+		return path;
+		#else
+		return path;
+		#end
 	}
 
 	/** Character ids resolve to data/characters/<id>.json; reject unknowns. */
