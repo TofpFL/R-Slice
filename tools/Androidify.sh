@@ -299,8 +299,10 @@ if [ "$FAIL" -eq 0 ]; then
 fi
 
 # ---------- lime Android ndll ----------
-# hmm.json installs lime from git (FunkinCrew/lime); git checkouts ship an
-# empty ndll/ dir, so liblime-*.so must be copied in from a release zip.
+# hmm.json installs lime from the FunkinCrew/lime git fork. Git checkouts
+# ship an empty ndll/ dir AND upstream release binaries are JNI-incompatible
+# with the fork, so liblime-*.so must be built from source with
+# "lime rebuild android" (same as the fork's Android CI). This takes a while.
 ensure_lime_ndll() {
   local lime_dir=""
   for d in "$ROOT"/.haxelib/lime/*/; do
@@ -311,7 +313,21 @@ ensure_lime_ndll() {
     echo "  [ OK ] lime Android ndll present"
     return 0
   fi
-  echo "  [ .. ] lime git checkout lacks Android ndll - fetching release libs..."
+  if [ -d "$lime_dir/.git" ] || [ -f "$lime_dir/.git" ]; then
+    echo "  [ .. ] lime git checkout lacks Android ndll - rebuilding from source..."
+    echo "         (this compiles SDL/lime for arm64-v8a + armeabi-v7a; can take a while)"
+    ( cd "$ROOT" && haxelib run lime rebuild android -release ) || {
+      echo "  [FAIL] lime rebuild android failed - see output above"
+      return 1
+    }
+    if ls "$lime_dir"/ndll/Android/liblime-64.so >/dev/null 2>&1; then
+      echo "  [ OK ] built lime Android ndll from pinned fork source"
+      return 0
+    fi
+    echo "  [FAIL] lime rebuild did not produce ndll/Android/liblime-64.so"
+    return 1
+  fi
+  echo "  [ .. ] lime install lacks Android ndll - fetching release libs..."
   local ver
   ver="$(grep -oE '"version"[^,}]*' "$lime_dir/haxelib.json" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
   local tmp; tmp="$(mktemp -d)"

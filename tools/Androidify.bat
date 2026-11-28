@@ -172,8 +172,10 @@ if %CHECK_ONLY%==1 (
   exit /b 0
 )
 rem ---------- lime Android ndll ----------
-rem hmm.json installs lime from git; git checkouts ship an empty ndll/ dir,
-rem so liblime-*.so must be copied in from a lib.haxe.org release zip.
+rem hmm.json installs lime from the FunkinCrew/lime git fork. Git checkouts
+rem ship an empty ndll/ dir AND upstream release binaries are JNI-incompatible
+rem with the fork, so liblime-*.so must be built from source with
+rem "lime rebuild android" (same as the fork's Android CI). This takes a while.
 set "LIME_DIR="
 for /d %%d in ("%ROOT%\.haxelib\lime\*") do (
   if exist "%%d\haxelib.json" if not defined LIME_DIR set "LIME_DIR=%%d"
@@ -184,6 +186,22 @@ if not defined LIME_DIR (
 ) else (
   if exist "%LIME_DIR%\ndll\Android\liblime-64.so" (
     echo   [ OK ] lime Android ndll present
+  ) else if exist "%LIME_DIR%\.git" (
+    echo   [ .. ] lime git checkout lacks Android ndll - rebuilding from source...
+    echo         ^(this compiles SDL/lime for arm64-v8a + armeabi-v7a; can take a while^)
+    pushd "%ROOT%"
+    call haxelib run lime rebuild android -release
+    set "REBUILD_RC=!ERRORLEVEL!"
+    popd
+    if !REBUILD_RC! neq 0 (
+      echo   [FAIL] lime rebuild android failed - see output above
+      set FAIL=1
+    ) else if exist "%LIME_DIR%\ndll\Android\liblime-64.so" (
+      echo   [ OK ] built lime Android ndll from pinned fork source
+    ) else (
+      echo   [FAIL] lime rebuild did not produce ndll/Android/liblime-64.so
+      set FAIL=1
+    )
   ) else (
     echo   [ .. ] lime git checkout lacks Android ndll - fetching release libs...
     set "LIME_ZIP=%TEMP%\androidify-lime.zip"
