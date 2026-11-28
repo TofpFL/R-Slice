@@ -8,6 +8,12 @@ This game was made with love to Newgrounds and its community. Extra love to Tom 
 
 # R-Slice (AKA: RAID Engine)
 
+> **STATUS: v0.8.6 TESTER BUILD — NEEDS MAJOR ARCHITECTURE FIXES.**
+> This is a pre-alpha development build for testing only. Expect crashes,
+> missing features, and breaking changes. It is not a stable release.
+> Current tester builds are published on the
+> [Releases](../../releases) page (`v0.8.6-testers`).
+
 **R-Slice is a Friday Night Funkin' engine** — a full rhythm-game host with
 song select, story mode, a chart editor, mod support, and Psych Engine-style
 scripting — built on the **V-Slice** codebase lineage. It is not a
